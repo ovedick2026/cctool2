@@ -200,7 +200,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 噪音过滤与上下文智能压缩 (保留 10 轮)
+// 4. 健壮型全量对话历史解析与智能压缩引擎
 // ==========================================
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
@@ -212,110 +212,28 @@ function cleanNoise(text) {
     .trim();
 }
 
-function compressHistorySteps(rawSteps) {
-  const trimmed = rawSteps.slice(-10);
-  if (trimmed.length === 0) return '（当前为初始化阶段，尚无执行历史）';
-
-  const lastReadMap = new Map();
-  trimmed.forEach((s, idx) => {
-    if (s.action === 'fs_read' && s.params?.file_path) {
-      lastReadMap.set(s.params.file_path, idx);
+// 格式化输出单项工具反馈，防超长溢出
+function formatFeedback(str, actionName) {
+  if (!str) return '[无输出内容 / 执行完成]';
+  str = String(str).trim();
+  if (actionName === 'fs_read' || actionName === 'Read') {
+    if (str.length > 2500) {
+      return str.slice(0, 1500) + '\n...[中间内容截断]...\n' + str.slice(-800);
     }
-  });
-
-  return trimmed.map((step, idx) => {
-    let feedback = step.feedback || '[SUCCESS] 执行完成';
-    let params = { ...step.params };
-
-    if (step.action === 'fs_write') {
-      const len = step.params?.content ? step.params.content.length : 0;
-      params.content = `[源码文件已写入本地磁盘，大小: ${len} 字符]`;
+  } else if (actionName === 'shell_exec' || actionName === 'Bash') {
+    if (str.length > 1500) {
+      return str.slice(0, 400) + `\n...[输出流水过长，折叠 ${str.length - 800} 字符]...\n` + str.slice(-400);
     }
-
-    if (step.action === 'fs_replace') {
-      if (params.old_string?.length > 80) params.old_string = params.old_string.slice(0, 30) + '...[略]...' + params.old_string.slice(-20);
-      if (params.new_string?.length > 80) params.new_string = params.new_string.slice(0, 30) + '...[略]...' + params.new_string.slice(-20);
-    }
-
-    if (step.action === 'fs_read') {
-      const p = step.params?.file_path;
-      if (lastReadMap.get(p) !== idx) {
-        feedback = `[早期版本已读取，第 ${lastReadMap.get(p) + 1} 步有最新读取结果，此处折叠]`;
-      } else if (feedback.length > 3000) {
-        feedback = feedback.slice(0, 1800) + '\n...[中间部分省略]...\n' + feedback.slice(-1000);
-      }
-    }
-
-    if (step.action === 'shell_exec') {
-      const hasErr = /error|fail|exit code [1-9]|command not found/i.test(feedback);
-      if (!hasErr && feedback.length > 800) {
-        feedback = feedback.slice(0, 250) + `\n...[输出流水已折叠 ${feedback.length - 500} 字符]...\n` + feedback.slice(-250);
-      } else if (hasErr && feedback.length > 2500) {
-        feedback = feedback.slice(-2500);
-      }
-    }
-
-    return `--- Step ${idx + 1} ---
-【执行配置】：
-${JSON.stringify({ step_thought: step.step_thought, action: step.action, params }, null, 2)}
-【本地执行反馈】：
-${feedback}`;
-  }).join('\n\n');
+  } else if (str.length > 1200) {
+    return str.slice(0, 600) + '\n...[略]...\n' + str.slice(-400);
+  }
+  return str;
 }
 
 function parseConversation(messages = []) {
   let globalTask = '';
-  const rawSteps = [];
-  let latestTurnInput = null;
-
-  for (const msg of messages) {
-    if (msg.role === 'user') {
-      let rawText = '';
-      if (typeof msg.content === 'string') {
-        rawText = msg.content;
-      } else if (Array.isArray(msg.content)) {
-        const textItems = msg.content.filter(c => c.type === 'text');
-        rawText = textItems.map(c => c.text).join('\n');
-      }
-      const clean = cleanNoise(rawText);
-      if (clean && !clean.startsWith('<tool_result') && !clean.includes("Today's date is")) {
-        globalTask = clean;
-        break;
-      }
-    }
-  }
-
-  if (!globalTask) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg.role === 'user') {
-        const text = cleanNoise(typeof msg.content === 'string' ? msg.content : (msg.content?.map(c => c.text || '').join('') || ''));
-        if (text && !text.startsWith('<tool_result')) {
-          globalTask = text;
-          break;
-        }
-      }
-    }
-  }
-  if (!globalTask) globalTask = '处理当前工作目录下的开发与代码任务。';
-
-  const lastMsg = messages[messages.length - 1];
-  if (lastMsg) {
-    if (typeof lastMsg.content === 'string') {
-      latestTurnInput = cleanNoise(lastMsg.content);
-    } else if (Array.isArray(lastMsg.content)) {
-      const results = lastMsg.content.filter(c => c.type === 'tool_result');
-      if (results.length > 0) {
-        latestTurnInput = results.map(r => {
-          let t = typeof r.content === 'string' ? r.content : (r.content?.map(c => c.text).join('') || '');
-          return `[工具回执 ID:${r.tool_use_id}]: ${t.slice(0, 150)}`;
-        }).join(' | ');
-      } else {
-        const tItem = lastMsg.content.find(c => c.type === 'text');
-        latestTurnInput = tItem ? cleanNoise(tItem.text) : '其他增量内容';
-      }
-    }
-  }
+  const historyTurns = [];
+  let currentTurn = null;
 
   const CC_TO_ACTION_MAP = {
     Write: 'fs_write', Read: 'fs_read', Edit: 'fs_replace', Bash: 'shell_exec',
@@ -325,31 +243,135 @@ function parseConversation(messages = []) {
     ReportFindings: 'code_audit'
   };
 
-  let activeStep = null;
+  // 1. 提取全局任务目标（优先取第一条人类发起的任务指令）
   for (const msg of messages) {
-    const parts = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content }];
+    if (msg.role === 'user') {
+      let rawText = '';
+      if (typeof msg.content === 'string') rawText = msg.content;
+      else if (Array.isArray(msg.content)) {
+        rawText = msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+      }
+      const clean = cleanNoise(rawText);
+      if (clean && !clean.startsWith('<tool_result') && !clean.includes("Today's date is") && !clean.startsWith('{')) {
+        globalTask = clean;
+        break;
+      }
+    }
+  }
+  if (!globalTask) globalTask = '处理当前工作目录下的任务推进。';
+
+  // 2. 遍历消息列表，全面捕获所有历史轮次
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    // ====== 处理 Assistant 轮次 ======
     if (msg.role === 'assistant') {
-      for (const p of parts) {
-        if (p.type === 'tool_use') {
-          activeStep = {
-            step_thought: `调度 ${p.name}`,
-            action: CC_TO_ACTION_MAP[p.name] || 'shell_exec',
-            params: p.input || {}
-          };
+      let thoughtText = '';
+      let toolAction = '';
+      let toolParams = null;
+
+      // A. Anthropic 结构化 content blocks
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part.type === 'text') {
+            thoughtText += cleanNoise(part.text) + '\n';
+          } else if (part.type === 'tool_use') {
+            toolAction = CC_TO_ACTION_MAP[part.name] || part.name;
+            toolParams = part.input;
+          }
+        }
+      } 
+      // B. OpenAI tool_calls 结构
+      else if (msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+        thoughtText = cleanNoise(typeof msg.content === 'string' ? msg.content : '');
+        const tc = msg.tool_calls[0];
+        const fnName = tc.function?.name || '';
+        toolAction = CC_TO_ACTION_MAP[fnName] || fnName;
+        try {
+          toolParams = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function?.arguments;
+        } catch {
+          toolParams = tc.function?.arguments;
+        }
+      } 
+      // C. 纯文本输出（带可能存在的标签或思考）
+      else if (typeof msg.content === 'string') {
+        const raw = cleanNoise(msg.content);
+        const parsed = extractActionAndThought(raw);
+        if (parsed) {
+          thoughtText = parsed.thought;
+          toolAction = parsed.action;
+          toolParams = parsed.params;
+        } else {
+          thoughtText = raw;
         }
       }
-    } else if (msg.role === 'user') {
-      for (const p of parts) {
-        if (p.type === 'tool_result' && activeStep) {
-          let out = typeof p.content === 'string' ? p.content : (p.content?.map(c => c.text).join('\n') || '');
-          rawSteps.push({ ...activeStep, feedback: out });
-          activeStep = null;
+
+      // 剔除纯任务初始命令，避免混淆
+      thoughtText = thoughtText.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '').trim();
+
+      currentTurn = {
+        thought: thoughtText || '推进当前步骤',
+        action: toolAction || 'text_response',
+        params: toolParams || {},
+        feedback: ''
+      };
+      historyTurns.push(currentTurn);
+    }
+
+    // ====== 处理 User 或 Tool 回执轮次 ======
+    else if (msg.role === 'user' || msg.role === 'tool') {
+      let feedbackText = '';
+
+      if (typeof msg.content === 'string') {
+        feedbackText = cleanNoise(msg.content);
+      } else if (Array.isArray(msg.content)) {
+        const parts = [];
+        for (const part of msg.content) {
+          if (part.type === 'tool_result') {
+            const res = typeof part.content === 'string' ? part.content : JSON.stringify(part.content);
+            parts.push(res);
+          } else if (part.type === 'text') {
+            parts.push(part.text);
+          }
         }
+        feedbackText = cleanNoise(parts.join('\n'));
+      }
+
+      // 将执行反馈回填到最近的一个 assistant 步骤中
+      if (currentTurn && feedbackText && !feedbackText.startsWith("Today's date is")) {
+        currentTurn.feedback = feedbackText;
       }
     }
   }
 
-  return { globalTask, historyLogsText: compressHistorySteps(rawSteps), latestTurnInput };
+  // 3. 构建高可读的【历史执行记录】
+  let historyLogsText = '';
+  // 排除掉最后一轮正在进行的消息，保留历史记录（最多保留最近 8 步）
+  const validSteps = historyTurns.filter(t => t.action !== 'text_response' || t.feedback);
+  const recentSteps = validSteps.slice(-8);
+
+  if (recentSteps.length === 0) {
+    historyLogsText = '（当前为初始化阶段，尚无历史记录）';
+  } else {
+    historyLogsText = recentSteps.map((s, idx) => {
+      let displayParams = { ...s.params };
+      if (s.action === 'fs_write' && displayParams.content) {
+        displayParams.content = `[文本内容已成功写入，长度 ${displayParams.content.length} 字符]`;
+      }
+      return `【步骤 ${idx + 1}】
+- 决策思考: ${s.thought}
+- 调度操作: ${s.action}
+- 参数配置: ${JSON.stringify(displayParams)}
+- 执行结果反馈:
+${formatFeedback(s.feedback || '[执行成功已完成]', s.action)}`;
+    }).join('\n\n');
+  }
+
+  return {
+    globalTask,
+    historyLogsText,
+    latestTurnInput: historyTurns[historyTurns.length - 1]?.feedback || '（继续下一步）'
+  };
 }
 
 // ==========================================
