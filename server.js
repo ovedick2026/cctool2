@@ -200,7 +200,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 健壮型全量对话历史解析与智能压缩引擎
+// 4. 对话历史解析与智能压缩引擎（标准 Step 格式还原版）
 // ==========================================
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
@@ -212,28 +212,95 @@ function cleanNoise(text) {
     .trim();
 }
 
-// 格式化输出单项工具反馈，防超长溢出
-function formatFeedback(str, actionName) {
-  if (!str) return '[无输出内容 / 执行完成]';
-  str = String(str).trim();
-  if (actionName === 'fs_read' || actionName === 'Read') {
-    if (str.length > 2500) {
-      return str.slice(0, 1500) + '\n...[中间内容截断]...\n' + str.slice(-800);
-    }
-  } else if (actionName === 'shell_exec' || actionName === 'Bash') {
-    if (str.length > 1500) {
-      return str.slice(0, 400) + `\n...[输出流水过长，折叠 ${str.length - 800} 字符]...\n` + str.slice(-400);
-    }
-  } else if (str.length > 1200) {
-    return str.slice(0, 600) + '\n...[略]...\n' + str.slice(-400);
+// 格式化输出本地执行反馈，防超长溢出并标准化标记
+function formatLocalFeedback(str, actionName) {
+  if (!str) return '[SUCCESS] 操作已执行完成';
+  let text = String(str).trim();
+
+  // 若终端反馈已明确成功但缺少 [SUCCESS] 标记，予以补齐
+  if (/successfully|created|updated|done|completed/i.test(text) && !text.startsWith('[')) {
+    text = `[SUCCESS] ${text}`;
   }
-  return str;
+
+  if (actionName === 'fs_read') {
+    if (text.length > 3000) {
+      return text.slice(0, 1800) + '\n...[中间内容省略]...\n' + text.slice(-1000);
+    }
+  } else if (actionName === 'shell_exec') {
+    const hasErr = /error|fail|exit code [1-9]|command not found/i.test(text);
+    if (!hasErr && text.length > 1000) {
+      return text.slice(0, 300) + `\n...[输出流水折叠 ${text.length - 600} 字符]...\n` + text.slice(-300);
+    } else if (hasErr && text.length > 2500) {
+      return text.slice(-2500);
+    }
+  } else if (text.length > 1500) {
+    return text.slice(0, 800) + '\n...[略]...\n' + text.slice(-500);
+  }
+  return text;
+}
+
+function compressHistorySteps(rawSteps) {
+  // 只保留有明确合法 Action 且有反馈的步骤，杜绝非法 text_response
+  const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
+  const trimmed = validSteps.slice(-10);
+  if (trimmed.length === 0) {
+    return '（当前为初始化阶段，尚无历史记录）';
+  }
+
+  const lastReadMap = new Map();
+  trimmed.forEach((s, idx) => {
+    if (s.action === 'fs_read' && s.params?.file_path) {
+      lastReadMap.set(s.params.file_path, idx);
+    }
+  });
+
+  return trimmed.map((step, idx) => {
+    let feedback = step.feedback || '[SUCCESS] 执行完成';
+    let params = { ...step.params };
+
+    // 参数智能压缩展示，避免将整篇文件回传给模型浪费上下文
+    if (step.action === 'fs_write') {
+      const len = step.params?.content ? String(step.params.content).length : 0;
+      params = { file_path: step.params?.file_path || 'file' };
+      if (len > 0) {
+        params.content = `[源码/文档内容已写入，共 ${len} 字符]`;
+      }
+    }
+    if (step.action === 'fs_replace') {
+      if (params.old_string?.length > 80) {
+        params.old_string = params.old_string.slice(0, 30) + '...[略]...' + params.old_string.slice(-20);
+      }
+      if (params.new_string?.length > 80) {
+        params.new_string = params.new_string.slice(0, 30) + '...[略]...' + params.new_string.slice(-20);
+      }
+    }
+    if (step.action === 'fs_read') {
+      const p = step.params?.file_path;
+      if (lastReadMap.get(p) !== idx) {
+        feedback = `[早期版本已读取，第 ${lastReadMap.get(p) + 1} 步有最新读取结果，此处折叠]`;
+      } else {
+        feedback = formatLocalFeedback(feedback, 'fs_read');
+      }
+    } else {
+      feedback = formatLocalFeedback(feedback, step.action);
+    }
+
+    // 严格按模型预期的 --- Step X --- 与【执行配置】JSON 格式输出
+    return `--- Step ${idx + 1} ---
+【执行配置】：
+${JSON.stringify({
+  step_thought: step.step_thought || `执行 ${step.action} 动作`,
+  action: step.action,
+  params: params
+}, null, 2)}
+【本地执行反馈】：
+${feedback}`;
+  }).join('\n\n');
 }
 
 function parseConversation(messages = []) {
   let globalTask = '';
-  const historyTurns = [];
-  let currentTurn = null;
+  const rawSteps = [];
 
   const CC_TO_ACTION_MAP = {
     Write: 'fs_write', Read: 'fs_read', Edit: 'fs_replace', Bash: 'shell_exec',
@@ -243,7 +310,7 @@ function parseConversation(messages = []) {
     ReportFindings: 'code_audit'
   };
 
-  // 1. 提取全局任务目标（优先取第一条人类发起的任务指令）
+  // 1. 提取全局初始目标
   for (const msg of messages) {
     if (msg.role === 'user') {
       let rawText = '';
@@ -260,118 +327,132 @@ function parseConversation(messages = []) {
   }
   if (!globalTask) globalTask = '处理当前工作目录下的任务推进。';
 
-  // 2. 遍历消息列表，全面捕获所有历史轮次
+  // 2. 双向成对解析状态机（支持 ID 精确配对与顺序匹配）
+  const pendingSteps = new Map();
+  let sequentialPending = [];
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
 
-    // ====== 处理 Assistant 轮次 ======
+    // ======== 解析 Assistant 调度动作 ========
     if (msg.role === 'assistant') {
-      let thoughtText = '';
-      let toolAction = '';
-      let toolParams = null;
+      let turnThought = '';
 
-      // A. Anthropic 结构化 content blocks
-      if (Array.isArray(msg.content)) {
-        for (const part of msg.content) {
-          if (part.type === 'text') {
-            thoughtText += cleanNoise(part.text) + '\n';
-          } else if (part.type === 'tool_use') {
-            toolAction = CC_TO_ACTION_MAP[part.name] || part.name;
-            toolParams = part.input;
-          }
-        }
-      } 
-      // B. OpenAI tool_calls 结构
-      else if (msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-        thoughtText = cleanNoise(typeof msg.content === 'string' ? msg.content : '');
-        const tc = msg.tool_calls[0];
-        const fnName = tc.function?.name || '';
-        toolAction = CC_TO_ACTION_MAP[fnName] || fnName;
-        try {
-          toolParams = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function?.arguments;
-        } catch {
-          toolParams = tc.function?.arguments;
-        }
-      } 
-      // C. 纯文本输出（带可能存在的标签或思考）
-      else if (typeof msg.content === 'string') {
-        const raw = cleanNoise(msg.content);
-        const parsed = extractActionAndThought(raw);
-        if (parsed) {
-          thoughtText = parsed.thought;
-          toolAction = parsed.action;
-          toolParams = parsed.params;
-        } else {
-          thoughtText = raw;
-        }
-      }
-
-      // 剔除纯任务初始命令，避免混淆
-      thoughtText = thoughtText.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '').trim();
-
-      currentTurn = {
-        thought: thoughtText || '推进当前步骤',
-        action: toolAction || 'text_response',
-        params: toolParams || {},
-        feedback: ''
-      };
-      historyTurns.push(currentTurn);
-    }
-
-    // ====== 处理 User 或 Tool 回执轮次 ======
-    else if (msg.role === 'user' || msg.role === 'tool') {
-      let feedbackText = '';
-
+      // 提取文本思考内容
       if (typeof msg.content === 'string') {
-        feedbackText = cleanNoise(msg.content);
+        const clean = cleanNoise(msg.content);
+        const tMatch = clean.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
+        turnThought = tMatch ? tMatch[1].trim() : clean.slice(0, 150);
       } else if (Array.isArray(msg.content)) {
-        const parts = [];
-        for (const part of msg.content) {
-          if (part.type === 'tool_result') {
-            const res = typeof part.content === 'string' ? part.content : JSON.stringify(part.content);
-            parts.push(res);
-          } else if (part.type === 'text') {
-            parts.push(part.text);
-          }
+        const textItem = msg.content.find(c => c.type === 'text');
+        if (textItem && textItem.text) {
+          const clean = cleanNoise(textItem.text);
+          const tMatch = clean.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
+          turnThought = tMatch ? tMatch[1].trim() : clean.slice(0, 150);
         }
-        feedbackText = cleanNoise(parts.join('\n'));
       }
 
-      // 将执行反馈回填到最近的一个 assistant 步骤中
-      if (currentTurn && feedbackText && !feedbackText.startsWith("Today's date is")) {
-        currentTurn.feedback = feedbackText;
+      // A. Anthropic 原生 tool_use 块
+      if (Array.isArray(msg.content)) {
+        for (const p of msg.content) {
+          if (p.type === 'tool_use') {
+            const mappedAction = CC_TO_ACTION_MAP[p.name] || 'shell_exec';
+            const stepObj = {
+              id: p.id,
+              step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
+              action: mappedAction,
+              params: p.input || {}
+            };
+            if (p.id) pendingSteps.set(p.id, stepObj);
+            sequentialPending.push(stepObj);
+          }
+        }
+      }
+
+      // B. OpenAI tool_calls 兼容
+      if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          const fnName = tc.function?.name || '';
+          const mappedAction = CC_TO_ACTION_MAP[fnName] || 'shell_exec';
+          let params = {};
+          try {
+            params = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {});
+          } catch {
+            params = {};
+          }
+          const stepObj = {
+            id: tc.id,
+            step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
+            action: mappedAction,
+            params
+          };
+          if (tc.id) pendingSteps.set(tc.id, stepObj);
+          sequentialPending.push(stepObj);
+        }
+      }
+
+      // C. 文本标签兼容（防某些客户端直接回传了包含 <tool_call> 的纯文本）
+      if (typeof msg.content === 'string' && msg.content.includes('<tool_call>')) {
+        const tcMatch = msg.content.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i);
+        if (tcMatch) {
+          try {
+            const parsed = JSON.parse(cleanLooseJson(tcMatch[1]));
+            if (parsed.name) {
+              const mappedAction = CC_TO_ACTION_MAP[parsed.name] || 'shell_exec';
+              sequentialPending.push({
+                step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
+                action: mappedAction,
+                params: parsed.arguments || {}
+              });
+            }
+          } catch {}
+        }
+      }
+    }
+
+    // ======== 解析 User / Tool 执行反馈并闭环 ========
+    else if (msg.role === 'user' || msg.role === 'tool') {
+      // 1. Anthropic 原生 tool_result 数组
+      if (Array.isArray(msg.content)) {
+        for (const p of msg.content) {
+          if (p.type === 'tool_result') {
+            const outText = typeof p.content === 'string' ? p.content : (p.content?.map(c => c.text).join('\n') || '');
+            let matchedStep = null;
+            if (p.tool_use_id && pendingSteps.has(p.tool_use_id)) {
+              matchedStep = pendingSteps.get(p.tool_use_id);
+              pendingSteps.delete(p.tool_use_id);
+            } else if (sequentialPending.length > 0) {
+              matchedStep = sequentialPending.shift();
+            }
+            if (matchedStep) {
+              rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
+            }
+          }
+        }
+      }
+      // 2. OpenAI 规范 tool 消息
+      else if (msg.role === 'tool' && msg.tool_call_id) {
+        const outText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+        let matchedStep = pendingSteps.get(msg.tool_call_id) || sequentialPending.shift();
+        if (matchedStep) {
+          rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
+        }
+      }
+      // 3. 纯文本反馈兼容
+      else if (typeof msg.content === 'string') {
+        const text = cleanNoise(msg.content);
+        if (text && !text.startsWith("Today's date is") && sequentialPending.length > 0) {
+          const matchedStep = sequentialPending.shift();
+          rawSteps.push({ ...matchedStep, feedback: text });
+        }
       }
     }
   }
 
-  // 3. 构建高可读的【历史执行记录】
-  let historyLogsText = '';
-  // 排除掉最后一轮正在进行的消息，保留历史记录（最多保留最近 8 步）
-  const validSteps = historyTurns.filter(t => t.action !== 'text_response' || t.feedback);
-  const recentSteps = validSteps.slice(-8);
+  const historyLogsText = compressHistorySteps(rawSteps);
+  const latestTurnInput = rawSteps.length > 0 ? rawSteps[rawSteps.length - 1].feedback : '（初始启动任务）';
 
-  if (recentSteps.length === 0) {
-    historyLogsText = '（当前为初始化阶段，尚无历史记录）';
-  } else {
-    historyLogsText = recentSteps.map((s, idx) => {
-      let displayParams = { ...s.params };
-      if (s.action === 'fs_write' && displayParams.content) {
-        displayParams.content = `[文本内容已成功写入，长度 ${displayParams.content.length} 字符]`;
-      }
-      return `【步骤 ${idx + 1}】
-- 决策思考: ${s.thought}
-- 调度操作: ${s.action}
-- 参数配置: ${JSON.stringify(displayParams)}
-- 执行结果反馈:
-${formatFeedback(s.feedback || '[执行成功已完成]', s.action)}`;
-    }).join('\n\n');
-  }
-
-  return {
-    globalTask,
-    historyLogsText,
-    latestTurnInput: historyTurns[historyTurns.length - 1]?.feedback || '（继续下一步）'
-  };
+  return { globalTask, historyLogsText, latestTurnInput };
 }
 
 // ==========================================
