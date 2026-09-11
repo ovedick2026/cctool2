@@ -200,7 +200,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 对话历史解析与智能压缩引擎（标准 Step 格式还原版）
+// 4. 对话历史解析与智能压缩引擎（支持 todo.md 打勾追踪版）
 // ==========================================
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
@@ -212,14 +212,19 @@ function cleanNoise(text) {
     .trim();
 }
 
-// 格式化输出本地执行反馈，防超长溢出并标准化标记
-function formatLocalFeedback(str, actionName) {
+// 格式化输出本地执行反馈，防超长溢出并对 todo.md 提供内容保护
+function formatLocalFeedback(str, actionName, isTodoFile = false) {
   if (!str) return '[SUCCESS] 操作已执行完成';
   let text = String(str).trim();
 
   // 若终端反馈已明确成功但缺少 [SUCCESS] 标记，予以补齐
   if (/successfully|created|updated|done|completed/i.test(text) && !text.startsWith('[')) {
     text = `[SUCCESS] ${text}`;
+  }
+
+  // 如果是 todo.md 相关操作，完整保留其读写反馈，确保状态链完整
+  if (isTodoFile) {
+    return text;
   }
 
   if (actionName === 'fs_read') {
@@ -240,7 +245,6 @@ function formatLocalFeedback(str, actionName) {
 }
 
 function compressHistorySteps(rawSteps) {
-  // 只保留有明确合法 Action 且有反馈的步骤，杜绝非法 text_response
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
   const trimmed = validSteps.slice(-10);
   if (trimmed.length === 0) {
@@ -257,35 +261,49 @@ function compressHistorySteps(rawSteps) {
   return trimmed.map((step, idx) => {
     let feedback = step.feedback || '[SUCCESS] 执行完成';
     let params = { ...step.params };
+    const isTodoFile = params.file_path === 'todo.md' || params.path === 'todo.md';
 
-    // 参数智能压缩展示，避免将整篇文件回传给模型浪费上下文
+    // 1. fs_write 参数处理
     if (step.action === 'fs_write') {
-      const len = step.params?.content ? String(step.params.content).length : 0;
-      params = { file_path: step.params?.file_path || 'file' };
-      if (len > 0) {
-        params.content = `[源码/文档内容已写入，共 ${len} 字符]`;
+      if (isTodoFile) {
+        // 核心保护：todo.md 是任务跟踪基准，完整保留清单条目，供模型获知精确条目进行打勾
+        params = {
+          file_path: 'todo.md',
+          content: step.params?.content || ''
+        };
+      } else {
+        const len = step.params?.content ? String(step.params.content).length : 0;
+        params = { file_path: step.params?.file_path || 'file' };
+        if (len > 0) {
+          params.content = `[源码/文档内容已写入，共 ${len} 字符]`;
+        }
       }
     }
+
+    // 2. fs_replace 参数处理（todo.md 的打勾替换文本不截断）
     if (step.action === 'fs_replace') {
-      if (params.old_string?.length > 80) {
-        params.old_string = params.old_string.slice(0, 30) + '...[略]...' + params.old_string.slice(-20);
-      }
-      if (params.new_string?.length > 80) {
-        params.new_string = params.new_string.slice(0, 30) + '...[略]...' + params.new_string.slice(-20);
+      if (!isTodoFile) {
+        if (params.old_string?.length > 80) {
+          params.old_string = params.old_string.slice(0, 30) + '...[略]...' + params.old_string.slice(-20);
+        }
+        if (params.new_string?.length > 80) {
+          params.new_string = params.new_string.slice(0, 30) + '...[略]...' + params.new_string.slice(-20);
+        }
       }
     }
+
+    // 3. fs_read 反馈处理
     if (step.action === 'fs_read') {
       const p = step.params?.file_path;
       if (lastReadMap.get(p) !== idx) {
         feedback = `[早期版本已读取，第 ${lastReadMap.get(p) + 1} 步有最新读取结果，此处折叠]`;
       } else {
-        feedback = formatLocalFeedback(feedback, 'fs_read');
+        feedback = formatLocalFeedback(feedback, 'fs_read', isTodoFile);
       }
     } else {
-      feedback = formatLocalFeedback(feedback, step.action);
+      feedback = formatLocalFeedback(feedback, step.action, isTodoFile);
     }
 
-    // 严格按模型预期的 --- Step X --- 与【执行配置】JSON 格式输出
     return `--- Step ${idx + 1} ---
 【执行配置】：
 ${JSON.stringify({
@@ -327,7 +345,7 @@ function parseConversation(messages = []) {
   }
   if (!globalTask) globalTask = '处理当前工作目录下的任务推进。';
 
-  // 2. 双向成对解析状态机（支持 ID 精确配对与顺序匹配）
+  // 2. 双向成对解析状态机
   const pendingSteps = new Map();
   let sequentialPending = [];
 
@@ -338,7 +356,6 @@ function parseConversation(messages = []) {
     if (msg.role === 'assistant') {
       let turnThought = '';
 
-      // 提取文本思考内容
       if (typeof msg.content === 'string') {
         const clean = cleanNoise(msg.content);
         const tMatch = clean.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
@@ -391,7 +408,7 @@ function parseConversation(messages = []) {
         }
       }
 
-      // C. 文本标签兼容（防某些客户端直接回传了包含 <tool_call> 的纯文本）
+      // C. 文本标签兼容
       if (typeof msg.content === 'string' && msg.content.includes('<tool_call>')) {
         const tcMatch = msg.content.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i);
         if (tcMatch) {
@@ -412,7 +429,6 @@ function parseConversation(messages = []) {
 
     // ======== 解析 User / Tool 执行反馈并闭环 ========
     else if (msg.role === 'user' || msg.role === 'tool') {
-      // 1. Anthropic 原生 tool_result 数组
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_result') {
@@ -429,17 +445,13 @@ function parseConversation(messages = []) {
             }
           }
         }
-      }
-      // 2. OpenAI 规范 tool 消息
-      else if (msg.role === 'tool' && msg.tool_call_id) {
+      } else if (msg.role === 'tool' && msg.tool_call_id) {
         const outText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
         let matchedStep = pendingSteps.get(msg.tool_call_id) || sequentialPending.shift();
         if (matchedStep) {
           rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
         }
-      }
-      // 3. 纯文本反馈兼容
-      else if (typeof msg.content === 'string') {
+      } else if (typeof msg.content === 'string') {
         const text = cleanNoise(msg.content);
         if (text && !text.startsWith("Today's date is") && sequentialPending.length > 0) {
           const matchedStep = sequentialPending.shift();
@@ -456,7 +468,7 @@ function parseConversation(messages = []) {
 }
 
 // ==========================================
-// 5. 强化版抗风控 Prompt (严格模板约束)
+// 5. 强化版抗风控 Prompt (含强约束打勾闭环机制)
 // ==========================================
 function buildPrompt(globalTask, historyLogsText) {
   return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
@@ -481,19 +493,34 @@ function buildPrompt(globalTask, historyLogsText) {
 5. 流程终结：
    - finish: {"summary": "全部流水线验收完成后的总结报告"}
 
-【流水线设计约束】：
+【流水线核心设计约束】：
 1. 拆解规范：当工作流初次启动（无历史记录）时，第一个步骤必须对任务进行极细致的拆解（具体到单文件、单页面或单步骤），输出一个 action 为 "fs_write" 的配置，将任务项全为 [ ] 的 todo.md 写入本地。
 2. 单步原则：每个回复只能输出当前唯一步骤的配置，不可合并多个步骤。
-3. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
-4. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n，不要打回车换行）。
+3. 状态闭环与打勾机制（最高优先级）：
+   - 流水线严格遵循『执行任务 -> 立即打勾 -> 推进下一项』的闭环原则。
+   - 当【历史执行记录】中上一动作已执行完毕并获得 [SUCCESS] 反馈后，若该动作完成了 todo.md 中的某一待办项，你的紧接着的下一步【必须】调度 "fs_replace"，将 todo.md 中对应的 "- [ ]" 精准替换为 "- [x]"！
+   - 严禁连续执行多个任务而不回写 todo.md 打勾！只有将当前项打勾闭环后，再下一步才能去执行新的待办项。
+4. 终止条件：当且仅当 todo.md 中所有待办项均已更新为 [x] 且全部验收完成时，输出 action 为 "finish" 的收尾配置。
+5. 格式严律：输出必须严格按照下方模板，JSON 字符串内部换行必须转义为 \\n，不要打回车换行。
 
 【强制返回格式模板示例】:
-【思考】: 说明当前步骤的意图与判断分析...
-【调度动作】: fs_write
+情境 A：执行常规步骤（如读取文件）
+【思考】: 说明当前步骤的意图与分析...
+【调度动作】: fs_read
+\`\`\`json
+{
+  "file_path": "/mnt/skills/public/pptx/SKILL.md"
+}
+\`\`\`
+
+情境 B：任务完成后的状态打勾（闭环）
+【思考】: 上一步已成功查阅了 PPT 制作规范，现将 todo.md 中对应的任务项状态由 [ ] 更新为 [x]。
+【调度动作】: fs_replace
 \`\`\`json
 {
   "file_path": "todo.md",
-  "content": "# 任务清单\\n- [ ] 步骤一\\n- [ ] 步骤二"
+  "old_string": "- [ ] 1. 查看/mnt/skills/public/pptx/SKILL.md，了解PPT制作规范与技巧",
+  "new_string": "- [x] 1. 查看/mnt/skills/public/pptx/SKILL.md，了解PPT制作规范与技巧"
 }
 \`\`\`
 
@@ -507,8 +534,9 @@ ${historyLogsText}
 【当前调度决策】：
 请综合【全局目标任务】与【历史执行记录】，评估当前阶段并输出下一步操作：
 - 若尚未初始化，输出生成详尽 todo.md 的单一配置。
-- 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
-- 若所有项已全部完成，输出 finish 配置。
+- 若刚执行完一个实际操作任务且获得成功反馈，【必须优先输出 fs_replace 将 todo.md 中该项标记为 [x]】。
+- 若对应项已打勾闭环，根据 todo.md 中下一个未完成的 [ ] 项输出对应的推进配置。
+- 若所有项已全部完成且均为 [x]，输出 finish 配置。
 请输出当前步骤的配置：`;
 }
 
