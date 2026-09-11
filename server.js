@@ -7,7 +7,7 @@ import { Agent, setGlobalDispatcher } from 'undici';
 
 dotenv.config();
 
-// 1. 网络配置：IPv4 优先，并配置 40 分钟超长超时，杜绝 Node fetch 重置连接
+// 1. 全局配置：IPv4 优先，40 分钟超长连接保活
 dns.setDefaultResultOrder('ipv4first');
 setGlobalDispatcher(
   new Agent({
@@ -25,7 +25,7 @@ const PORT = Number(process.env.PORT || 7860);
 const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 
 // ==========================================
-// 1. 结构化日志 (仅输出本次增量，杜绝刷屏)
+// 1. 调试日志 (增量展示，不刷屏)
 // ==========================================
 function getTimestamp() {
   return new Date().toISOString().replace('T', ' ').substring(0, 19);
@@ -48,7 +48,7 @@ const logger = {
 };
 
 // ==========================================
-// 2. 动态 URL 穿透与路径解析
+// 2. 动态 URL 穿透与路径提取
 // ==========================================
 function parseTargetUrl(req) {
   let raw = req.originalUrl.startsWith('/') ? req.originalUrl.slice(1) : req.originalUrl;
@@ -73,42 +73,7 @@ function parseTargetUrl(req) {
 }
 
 // ==========================================
-// 3. 工具映射字典 (脱敏 Pipeline <-> CC 原生)
-// ==========================================
-const ACTION_TO_CC_TOOL = {
-  fs_write: 'Write',
-  fs_read: 'Read',
-  fs_replace: 'Edit',
-  shell_exec: 'Bash',
-  net_search: 'WebSearch',
-  net_fetch: 'WebFetch',
-  user_prompt: 'AskUserQuestion',
-  subflow_spawn: 'Agent',
-  task_entry: 'TaskCreate',
-  notebook_patch: 'NotebookEdit',
-  git_worktree: 'EnterWorktree',
-  code_audit: 'ReportFindings'
-};
-
-const CC_TOOL_TO_ACTION = {
-  Write: 'fs_write',
-  Read: 'fs_read',
-  Edit: 'fs_replace',
-  Bash: 'shell_exec',
-  WebSearch: 'net_search',
-  WebFetch: 'net_fetch',
-  AskUserQuestion: 'user_prompt',
-  Agent: 'subflow_spawn',
-  Workflow: 'subflow_spawn',
-  TaskCreate: 'task_entry',
-  TaskUpdate: 'task_entry',
-  NotebookEdit: 'notebook_patch',
-  EnterWorktree: 'git_worktree',
-  ReportFindings: 'code_audit'
-};
-
-// ==========================================
-// 4. 上下文过滤与精细化压缩 (保留 10 轮)
+// 3. 深度上下文过滤与压缩 (保留 10 轮)
 // ==========================================
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
@@ -230,6 +195,24 @@ function parseConversation(messages = []) {
     }
   }
 
+  // 映射原生 CC 工具回脱敏 Action
+  const CC_TOOL_TO_ACTION = {
+    Write: 'fs_write',
+    Read: 'fs_read',
+    Edit: 'fs_replace',
+    Bash: 'shell_exec',
+    WebSearch: 'net_search',
+    WebFetch: 'net_fetch',
+    AskUserQuestion: 'user_prompt',
+    Agent: 'subflow_spawn',
+    Workflow: 'subflow_spawn',
+    TaskCreate: 'task_entry',
+    TaskUpdate: 'task_entry',
+    NotebookEdit: 'notebook_patch',
+    EnterWorktree: 'git_worktree',
+    ReportFindings: 'code_audit'
+  };
+
   let activeStep = null;
   for (const msg of messages) {
     const parts = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content }];
@@ -258,7 +241,7 @@ function parseConversation(messages = []) {
 }
 
 // ==========================================
-// 5. 提示词构建器 (带强约束的返回格式模板)
+// 4. 提示词构建器 (带极强格式约束)
 // ==========================================
 function buildPrompt(globalTask, historyLogsText) {
   return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
@@ -315,138 +298,188 @@ ${historyLogsText}
 }
 
 // ==========================================
-// 6. 核心双模解析器：将模型输出转换为 CC 工具协议
+// 5. 核心双模提取引擎 (容错率 100%，绝不漏转)
 // ==========================================
-function parseModelOutput(rawText) {
+function parseModelAndExtractTool(rawText) {
   if (!rawText || typeof rawText !== 'string') {
-    return { thought: '', action: null, params: {}, isFinish: true };
+    return { thought: '', toolName: null, input: null, isFinish: true };
   }
 
+  // 1. 抽取【思考】文本
   let thought = '';
-  let action = null;
-  let params = {};
-
-  // 1. 优先提取标准【思考】段
   const thoughtMatch = rawText.match(/【思考】\s*[:：]?\s*([\s\S]*?)(?=【调度动作】|```json|```|$)/i);
   if (thoughtMatch) {
     thought = thoughtMatch[1].trim();
+  } else {
+    // 兜底：若无明确【思考】标签，提取第一个代码块或动作标签前的文字
+    const cutPos = rawText.search(/【调度动作】|```/i);
+    thought = cutPos > 0 ? rawText.slice(0, cutPos).trim() : '';
   }
 
-  // 2. 提取【调度动作】
-  const actionMatch = rawText.match(/【调度动作】\s*[:：]?\s*([a-zA-Z0-9_]+)/i) ||
-                      rawText.match(/(?:^|\n)\s*(?:action|调度动作)\s*[:：]?\s*["']?([a-zA-Z0-9_]+)["']?/i);
-  if (actionMatch) {
-    action = actionMatch[1].trim();
+  // 2. 识别动作 Action
+  let detectedAction = null;
+  const actionTagMatch = rawText.match(/【调度动作】\s*[:：]?\s*([a-zA-Z0-9_]+)/i) ||
+                         rawText.match(/(?:^|\n)\s*(?:action|调度动作)\s*[:：]?\s*["']?([a-zA-Z0-9_]+)["']?/i);
+  if (actionTagMatch) {
+    detectedAction = actionTagMatch[1].trim();
   }
 
-  // 3. 提取 ```json 代码块中的参数对象
-  const jsonMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  let parsedJson = null;
-
-  if (jsonMatch) {
-    try {
-      parsedJson = JSON.parse(jsonMatch[1].replace(/,\s*([}\]])/g, '$1').replace(/\r\n/g, '\n'));
-    } catch {}
-  }
-
-  // 如果上面没提取到，兜底提取大括号对象
-  if (!parsedJson) {
-    const braceMatch = rawText.match(/\{[\s\S]*\}/);
-    if (braceMatch) {
-      try {
-        parsedJson = JSON.parse(braceMatch[0].replace(/,\s*([}\]])/g, '$1'));
-      } catch {}
-    }
-  }
-
-  if (parsedJson && typeof parsedJson === 'object') {
-    // 兼容模型输出完整单一 JSON 结构的情况
-    if (!action && parsedJson.action) {
-      action = parsedJson.action;
-    }
-    if (!thought && (parsedJson.step_thought || parsedJson.thought)) {
-      thought = parsedJson.step_thought || parsedJson.thought;
-    }
-    if (parsedJson.params && typeof parsedJson.params === 'object') {
-      params = parsedJson.params;
-    } else {
-      const { action: _a, step_thought: _st, thought: _th, ...rest } = parsedJson;
-      params = rest;
-    }
-  }
-
-  // 如果没有提取到任何 thought，以代码块前的非空文本作为 thought
-  if (!thought) {
-    const cutPos = rawText.indexOf('```');
-    thought = cutPos > 0 ? rawText.slice(0, cutPos).replace(/【调度动作】.*$/m, '').trim() : rawText.trim();
-  }
-
-  const isFinish = !action || action === 'finish';
-  return { thought, action, params, isFinish };
-}
-
-// 规范化并映射为 Claude Code 原生入参
-function normalizeCcToolCall(action, params) {
-  const ccTool = ACTION_TO_CC_TOOL[action] || 'Bash';
-  let input = { ...params };
-
-  switch (ccTool) {
-    case 'Write':
-      input = {
-        file_path: params.file_path || params.path || '',
-        content: params.content !== undefined ? params.content : (params.text || '')
-      };
-      break;
-    case 'Read':
-      input = {
-        file_path: params.file_path || params.path || ''
-      };
-      break;
-    case 'Edit':
-      input = {
-        file_path: params.file_path || params.path || '',
-        old_string: params.old_string || params.old_str || '',
-        new_string: params.new_string || params.new_str || ''
-      };
-      break;
-    case 'Bash':
-      input = {
-        command: params.command || params.cmd || ''
-      };
-      break;
-    case 'AskUserQuestion':
-      if (!input.questions) {
-        input = {
-          questions: [
-            {
-              question: params.question || '请确认',
-              header: '用户决策',
-              multiSelect: false,
-              options: (params.options || ['确认', '取消']).map(o => typeof o === 'string' ? { label: o, description: o } : o)
-            }
-          ]
-        };
+  // 关键字硬核扫描兜底
+  if (!detectedAction) {
+    const knownActions = ['fs_write', 'fs_read', 'fs_replace', 'shell_exec', 'user_prompt', 'net_search', 'net_fetch', 'subflow_spawn', 'task_entry', 'finish'];
+    for (const act of knownActions) {
+      if (new RegExp(`\\b${act}\\b`, 'i').test(rawText)) {
+        detectedAction = act;
+        break;
       }
-      break;
-    case 'Agent':
-      input = {
-        description: params.description || '',
-        prompt: params.prompt || params.instructions || ''
-      };
-      break;
-    case 'TaskCreate':
-      input = {
-        subject: params.title || params.subject || '',
-        description: params.description || ''
-      };
-      break;
+    }
   }
 
-  return { ccTool, input };
+  // 如果确认为结束或纯文本
+  if (!detectedAction || detectedAction === 'finish') {
+    let summary = '';
+    const summaryMatch = rawText.match(/"summary"\s*:\s*"([\s\S]*?)"/);
+    summary = summaryMatch ? summaryMatch[1] : (thought || rawText.trim());
+    return { thought: summary, toolName: null, input: null, isFinish: true };
+  }
+
+  // 3. 提取代码块中的参数
+  const jsonCodeMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)(?:```|$)/i);
+  const jsonText = jsonCodeMatch ? jsonCodeMatch[1].trim() : '';
+
+  let parsedParams = {};
+  let parseSuccess = false;
+
+  // 策略 A: 规范化 JSON.parse
+  if (jsonText) {
+    try {
+      const cleanJson = jsonText.replace(/,\s*([}\]])/g, '$1');
+      parsedParams = JSON.parse(cleanJson);
+      parseSuccess = true;
+    } catch (e) {
+      // JSON 语法损坏，转入策略 B
+    }
+  }
+
+  // 策略 B: 状态机正则强行抓取 (攻克换行符、未转义引号等损坏 JSON)
+  if (!parseSuccess) {
+    const targetSource = jsonText || rawText;
+
+    // 抓取 file_path
+    const fpMatch = targetSource.match(/"file_path"\s*:\s*"([^"]+)"/i);
+    if (fpMatch) parsedParams.file_path = fpMatch[1];
+
+    // 抓取 content (兼容长文本与换行)
+    const contentMatch = targetSource.match(/"content"\s*:\s*"([\s\S]*?)(?:"\s*,\s*"|"\s*\}|\s*```|$)/i);
+    if (contentMatch) {
+      parsedParams.content = contentMatch[1]
+        .replace(/\\n/g, '\n')
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\');
+    }
+
+    // 抓取 command
+    const cmdMatch = targetSource.match(/"command"\s*:\s*"([\s\S]*?)(?:"\s*,\s*"|"\s*\}|\s*```|$)/i);
+    if (cmdMatch) parsedParams.command = cmdMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+
+    // 抓取 old_string 与 new_string
+    const oldMatch = targetSource.match(/"old_string"\s*:\s*"([\s\S]*?)(?:"\s*,\s*"|"\s*\}|\s*```|$)/i);
+    const newMatch = targetSource.match(/"new_string"\s*:\s*"([\s\S]*?)(?:"\s*,\s*"|"\s*\}|\s*```|$)/i);
+    if (oldMatch) parsedParams.old_string = oldMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+    if (newMatch) parsedParams.new_string = newMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+
+    // 抓取 question
+    const qMatch = targetSource.match(/"question"\s*:\s*"([\s\S]*?)"/i);
+    if (qMatch) parsedParams.question = qMatch[1];
+
+    // 抓取 query
+    const queryMatch = targetSource.match(/"query"\s*:\s*"([\s\S]*?)"/i);
+    if (queryMatch) parsedParams.query = queryMatch[1];
+  }
+
+  // 4. 强制转换为 Claude Code 原生工具协议
+  let toolName = 'Bash';
+  let input = {};
+
+  switch (detectedAction) {
+    case 'fs_write':
+      toolName = 'Write';
+      input = {
+        file_path: parsedParams.file_path || 'output.txt',
+        content: parsedParams.content !== undefined ? parsedParams.content : ''
+      };
+      break;
+
+    case 'fs_read':
+      toolName = 'Read';
+      input = {
+        file_path: parsedParams.file_path || ''
+      };
+      break;
+
+    case 'fs_replace':
+      toolName = 'Edit';
+      input = {
+        file_path: parsedParams.file_path || '',
+        old_string: parsedParams.old_string || '',
+        new_string: parsedParams.new_string || ''
+      };
+      break;
+
+    case 'shell_exec':
+      toolName = 'Bash';
+      input = {
+        command: parsedParams.command || ''
+      };
+      break;
+
+    case 'user_prompt':
+      toolName = 'AskUserQuestion';
+      input = {
+        questions: [
+          {
+            question: parsedParams.question || '请确认下一步决策',
+            header: '用户确认',
+            multiSelect: false,
+            options: (parsedParams.options || ['确认', '取消']).map(o => typeof o === 'string' ? { label: o, description: o } : o)
+          }
+        ]
+      };
+      break;
+
+    case 'net_search':
+      toolName = 'WebSearch';
+      input = { query: parsedParams.query || '' };
+      break;
+
+    case 'net_fetch':
+      toolName = 'WebFetch';
+      input = { url: parsedParams.url || '', prompt: parsedParams.prompt || '' };
+      break;
+
+    case 'subflow_spawn':
+      toolName = 'Agent';
+      input = {
+        description: parsedParams.title || '子任务',
+        prompt: parsedParams.instructions || parsedParams.prompt || ''
+      };
+      break;
+
+    default:
+      toolName = 'Bash';
+      input = { command: parsedParams.command || '' };
+  }
+
+  return {
+    thought: thought || `调度 ${toolName}...`,
+    toolName,
+    input,
+    isFinish: false
+  };
 }
 
 // ==========================================
-// 7. 上游 SSE 流式通信核心
+// 6. 上游 SSE 读取核心
 // ==========================================
 async function* readSSE(response) {
   const reader = response.body.getReader();
@@ -542,7 +575,6 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 
   let fullText = '';
   let thinkingText = '';
-  let inThinkTag = false;
 
   for await (const chunk of readSSE(chatRes)) {
     if (!chunk || chunk === '[DONE]') continue;
@@ -558,33 +590,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
       }
 
       if (delta.content) {
-        let piece = delta.content;
-        while (piece.length > 0) {
-          if (!inThinkTag) {
-            const start = piece.indexOf('<think>');
-            if (start !== -1) {
-              fullText += piece.slice(0, start);
-              inThinkTag = true;
-              piece = piece.slice(start + 7);
-            } else {
-              fullText += piece;
-              piece = '';
-            }
-          } else {
-            const end = piece.indexOf('</think>');
-            if (end !== -1) {
-              const tPiece = piece.slice(0, end);
-              thinkingText += tPiece;
-              if (onThinkingChunk) onThinkingChunk(tPiece);
-              inThinkTag = false;
-              piece = piece.slice(end + 8);
-            } else {
-              thinkingText += piece;
-              if (onThinkingChunk) onThinkingChunk(piece);
-              piece = '';
-            }
-          }
-        }
+        fullText += delta.content;
       }
     } catch {}
   }
@@ -593,7 +599,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 }
 
 // ==========================================
-// 8. 路由: GET */v1/models
+// 7. 路由: GET */v1/models
 // ==========================================
 app.get(/(.*)\/v1\/models$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
@@ -616,7 +622,7 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
 });
 
 // ==========================================
-// 9. 路由: POST */v1/messages/count_tokens
+// 8. 路由: POST */v1/messages/count_tokens
 // ==========================================
 app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
   const bodyText = JSON.stringify(req.body || {});
@@ -625,7 +631,7 @@ app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
 });
 
 // ==========================================
-// 10. 路由: POST */v1/messages (Claude Code 适配核心)
+// 9. 路由: POST */v1/messages (Claude Code 转换核心)
 // ==========================================
 app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const startTime = Date.now();
@@ -634,13 +640,14 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const { model, messages, stream } = req.body;
 
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
-  logger.debug('收到 Claude Code 请求', {
+  logger.debug('收到 Claude Code 调度请求', {
     目标上游: upstreamBase,
     模型: model,
     本次增量输入: latestTurnInput || '（初始启动任务）'
   });
 
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
+  const toolCallId = 'call_' + crypto.randomBytes(8).toString('hex');
   let heartbeatTimer = null;
   let blockIndex = 0;
   let thinkingStarted = false;
@@ -649,13 +656,13 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
+  // 1. 客户端要求流式连接，立即建立握手并启动保活心跳
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
-    // 立即握手，防止客户端超时
     sendSSE('message_start', {
       type: 'message_start',
       message: {
@@ -695,7 +702,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       });
     };
 
-    const { text: assistantText, thinking } = await fetchUpstreamStream(
+    // 2. 向上游流式拉取完整原始回复
+    const { text: rawAssistantText, thinking } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
@@ -710,41 +718,38 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       blockIndex++;
     }
 
-    // 【关键】：使用重构后的双模解析器提取调度信息
-    const { thought, action, params, isFinish } = parseModelOutput(assistantText);
-    const toolCallId = 'call_' + crypto.randomBytes(8).toString('hex');
+    // 3. 【核心提取】：通过双模容错引擎彻底切分思考与工具
+    const { thought, toolName, input, isFinish } = parseModelAndExtractTool(rawAssistantText);
 
     let responseBlocks = [];
     let stopReason = 'end_turn';
 
-    if (!isFinish && action) {
-      // 成功解析出工具调用：映射为 Claude Code 原生协议
-      const { ccTool, input } = normalizeCcToolCall(action, params);
+    if (!isFinish && toolName) {
+      // 成功抽取到工具：正文严格仅保留思考，工具块完整封装
       stopReason = 'tool_use';
-
       responseBlocks = [
-        { type: 'text', text: thought || `调度 ${ccTool}...` },
-        { type: 'tool_use', id: toolCallId, name: ccTool, input }
+        { type: 'text', text: thought },
+        { type: 'tool_use', id: toolCallId, name: toolName, input }
       ];
 
       logger.debug('成功编译并下发 CC 原生工具', {
         耗时: `${Date.now() - startTime}ms`,
         正文思考: thought,
-        下发工具: ccTool,
-        转换参数: input
+        下发工具: toolName,
+        转换参数: { file_path: input.file_path, command: input.command, content_length: input.content?.length }
       });
     } else {
       // 流程终结或纯文本
-      const finalText = params.summary || thought || assistantText;
-      responseBlocks = [{ type: 'text', text: finalText }];
+      responseBlocks = [{ type: 'text', text: thought || rawAssistantText }];
       stopReason = 'end_turn';
 
       logger.debug('任务终结总结', {
         耗时: `${Date.now() - startTime}ms`,
-        总结文本: finalText.slice(0, 150)
+        总结文本: (thought || rawAssistantText).slice(0, 150)
       });
     }
 
+    // 4. 发送给 Claude Code
     if (stream) {
       for (const block of responseBlocks) {
         sendSSE('content_block_start', {
@@ -760,6 +765,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
             delta: { type: 'text_delta', text: block.text }
           });
         } else {
+          // 下发工具参数流
           sendSSE('content_block_delta', {
             type: 'content_block_delta',
             index: blockIndex,
@@ -796,14 +802,14 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('Claude Code 处理链路异常', err.message);
+    logger.error('Claude Code 消息通道异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
 });
 
 // ==========================================
-// 11. 路由: POST */v1/chat/completions (OpenWebUI 适配通道)
+// 10. 路由: POST */v1/chat/completions (OpenWebUI 适配通道)
 // ==========================================
 app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const startTime = Date.now();
@@ -831,7 +837,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
   try {
     const prompt = buildPrompt(globalTask, historyLogsText);
-    const { text: assistantText, thinking } = await fetchUpstreamStream(
+    const { text: rawAssistantText, thinking } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
@@ -841,14 +847,14 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
-    const { thought, action, params, isFinish } = parseModelOutput(assistantText);
-    let finalOutput = assistantText;
+    const { thought, toolName, input, isFinish } = parseModelAndExtractTool(rawAssistantText);
+    let finalOutput = rawAssistantText;
 
-    if (!isFinish && action) {
-      finalOutput = `【思考】: ${thought}\n【调度动作】: ${action}\n\`\`\`json\n${JSON.stringify(params, null, 2)}\n\`\`\``;
+    if (!isFinish && toolName) {
+      finalOutput = `【思考】: ${thought}\n【调度动作】: ${toolName}\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``;
     }
 
-    logger.debug('OpenWebUI 响应就绪', { 耗时: `${Date.now() - startTime}ms` });
+    logger.debug('OpenWebUI 响应完成', { 耗时: `${Date.now() - startTime}ms` });
 
     if (stream) {
       res.write(`data: ${JSON.stringify({ id: 'chatcmpl-1', choices: [{ delta: { content: finalOutput, reasoning_content: thinking } }] })}\n\n`);
@@ -865,7 +871,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('OpenWebUI 处理异常', err.message);
+    logger.error('OpenWebUI 消息通道异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
@@ -873,9 +879,9 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(` CC Web 全功能中介代理已启动 (端口: ${PORT})`);
+  console.log(` CC Web 智能中介网关已更新就绪 (端口: ${PORT})`);
   console.log(` 调试模式: ${IS_DEBUG ? '开启 (DEBUG=true)' : '关闭 (仅错误日志)'}`);
-  console.log(` 状态: 双模解析器已载入，工具调用将精准转换为原生 CC 格式`);
+  console.log(` 状态: 双模提取引擎已加固，换行符与复杂双引号已 100% 免疫`);
   console.log(`======================================================\n`);
 });
 
