@@ -9,7 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 
-const PORT = process.env.PORT || 8045;
+const PORT = process.env.PORT || 7860;
 const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 
 // ==========================================
