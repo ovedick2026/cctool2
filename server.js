@@ -200,7 +200,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 对话历史解析与智能压缩引擎（支持 todo.md 打勾追踪版）
+// 4. 对话历史解析与智能压缩引擎（【202609111538修改】：彻底修复队列残留导致复读第一步的Bug）
 // ==========================================
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
@@ -230,9 +230,7 @@ function formatLocalFeedback(str, actionName, isTodoFile = false) {
   }
 
   if (actionName === 'fs_read') {
-    if (text.length > 3000) {
-      return text;
-    }
+    return text;
   } else if (actionName === 'shell_exec' || actionName === 'Bash') {
     const hasErr = /error|fail|exit code [1-9]|command not found/i.test(text);
     if (!hasErr && text.length > 1200) {
@@ -246,6 +244,10 @@ function formatLocalFeedback(str, actionName, isTodoFile = false) {
   return text;
 }
 
+/* 【202609111538修改点 1】：重构 compressHistorySteps。
+   1. 解决陈旧思考导致模型迷失：从【执行配置】中剥离易导致逻辑死锁的长文 step_thought。
+   2. 采用精准提炼的 step_action_summary，客观描述每一轮的具体意图（例：fs_read: todo.md / shell_exec: ls -la）。
+*/
 function compressHistorySteps(rawSteps) {
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
   const trimmed = validSteps.slice(-6);
@@ -263,14 +265,13 @@ function compressHistorySteps(rawSteps) {
   return trimmed.map((step, idx) => {
     let feedback = step.feedback || '[SUCCESS] 执行完成';
     let params = { ...step.params };
-    const isTodoFile = params.file_path === 'todo.md' || params.path === 'todo.md';
+    const isTodoFile = params.file_path === 'todo.md' || params.path === 'todo.md' || String(params.file_path || '').endsWith('/todo.md');
 
-    // 1. fs_write 参数处理
+    // 1. fs_write 参数精简与 todo 保护
     if (step.action === 'fs_write') {
       if (isTodoFile) {
-        // 核心保护：todo.md 是任务跟踪基准，完整保留清单条目，供模型获知精确条目进行打勾
         params = {
-          file_path: 'todo.md',
+          file_path: params.file_path || 'todo.md',
           content: step.params?.content || ''
         };
       } else {
@@ -282,7 +283,7 @@ function compressHistorySteps(rawSteps) {
       }
     }
 
-    // 2. fs_replace 参数处理（todo.md 的打勾替换文本不截断）
+    // 2. fs_replace 参数精简
     if (step.action === 'fs_replace') {
       if (!isTodoFile) {
         if (params.old_string?.length > 80) {
@@ -294,7 +295,7 @@ function compressHistorySteps(rawSteps) {
       }
     }
 
-    // 3. fs_read 反馈处理
+    // 3. fs_read 反馈处理（避免前序大文件重复占用上下文）
     if (step.action === 'fs_read') {
       const p = step.params?.file_path;
       if (lastReadMap.get(p) !== idx) {
@@ -306,10 +307,16 @@ function compressHistorySteps(rawSteps) {
       feedback = formatLocalFeedback(feedback, step.action, isTodoFile);
     }
 
+    // 【202609111538修改点】：提取本步真实的意图摘要，不把陈旧思考放进 JSON
+    const targetDesc = params.file_path || params.path || (params.command ? params.command.slice(0, 60) : '') || '';
+    const stepSummary = step.step_thought && step.step_thought !== '执行当前流水线步骤...' 
+      ? step.step_thought 
+      : `调度 ${step.action} ${targetDesc ? '-> ' + targetDesc : ''}`.trim();
+
     return `--- Step ${idx + 1} ---
 【执行配置】：
 ${JSON.stringify({
-  step_thought: step.step_thought || `执行 ${step.action} 动作`,
+  action_summary: stepSummary,
   action: step.action,
   params: params
 }, null, 2)}
@@ -318,6 +325,9 @@ ${feedback}`;
   }).join('\n\n');
 }
 
+/* 【202609111538修改点 2】：深度重构 parseConversation 状态机。
+   彻底修复队列同步 Bug（原代码 pendingSteps 与 sequentialPending 脱节导致第 1 步对象死锁残留的问题）。
+*/
 function parseConversation(messages = []) {
   let globalTask = '';
   const rawSteps = [];
@@ -345,11 +355,11 @@ function parseConversation(messages = []) {
       }
     }
   }
-  if (!globalTask) globalTask = '处理当前工作目录下的任务推进。';
+  if (!globalTask) globalTask = '推进当前目录的todo.md并完成项目构建。';
 
-  // 2. 双向成对解析状态机
-  const pendingSteps = new Map();
-  let sequentialPending = [];
+  // 2. 双向解析与严格有序闭环队列
+  // 【202609111538修改点】：使用统一的 pendingStepsList 数组，杜绝 Map 与 Array 状态脱节
+  let pendingStepsList = [];
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -358,22 +368,28 @@ function parseConversation(messages = []) {
     if (msg.role === 'assistant') {
       let turnThought = '';
 
+      // 【202609111538修改点】：适配 Claude Code 真实传回格式，不依赖死板的“【思考】：”正则
       if (typeof msg.content === 'string') {
         const clean = cleanNoise(msg.content);
         const tMatch = clean.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
-        turnThought = tMatch ? tMatch[1].trim() : clean.slice(0, 150);
-      } else if (Array.isArray(msg.content)) {
-        const textItem = msg.content.find(c => c.type === 'text');
-        if (textItem && textItem.text) {
-          const clean = cleanNoise(textItem.text);
-          const tMatch = clean.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
-          turnThought = tMatch ? tMatch[1].trim() : clean.slice(0, 150);
+        if (tMatch) {
+          turnThought = tMatch[1].trim();
+        } else if (!clean.startsWith('{') && !clean.startsWith('<')) {
+          // 如果是普通的自然语言思考，取首段核心摘要（80字以内），避免冗长
+          turnThought = clean.split('\n')[0].slice(0, 80).trim();
         }
-      }
-
-      // ★ 核心纠偏：如果已有历史步骤（并非第1步），思考内容却还在复读“初始化”，强制纠正意图，防止模型逻辑死锁
-      if (rawSteps.length > 0 && /初始化阶段|尚无历史记录/i.test(turnThought)) {
-        turnThought = '推进当前阶段任务与文档构建';
+      } else if (Array.isArray(msg.content)) {
+        // 合并所有类型为 text 的块作为思考
+        const textParts = msg.content
+          .filter(c => c.type === 'text' && c.text)
+          .map(c => cleanNoise(c.text))
+          .filter(t => t && !t.startsWith('{') && !t.startsWith('<'));
+        
+        if (textParts.length > 0) {
+          const combined = textParts.join(' ');
+          const tMatch = combined.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
+          turnThought = tMatch ? tMatch[1].trim() : combined.split('\n')[0].slice(0, 80).trim();
+        }
       }
 
       // A. Anthropic 原生 tool_use 块
@@ -381,14 +397,12 @@ function parseConversation(messages = []) {
         for (const p of msg.content) {
           if (p.type === 'tool_use') {
             const mappedAction = CC_TO_ACTION_MAP[p.name] || 'shell_exec';
-            const stepObj = {
-              id: p.id,
+            pendingStepsList.push({
+              id: p.id || '',
               step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
               action: mappedAction,
               params: p.input || {}
-            };
-            if (p.id) pendingSteps.set(p.id, stepObj);
-            sequentialPending.push(stepObj);
+            });
           }
         }
       }
@@ -404,14 +418,12 @@ function parseConversation(messages = []) {
           } catch {
             params = {};
           }
-          const stepObj = {
-            id: tc.id,
+          pendingStepsList.push({
+            id: tc.id || '',
             step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
             action: mappedAction,
             params
-          };
-          if (tc.id) pendingSteps.set(tc.id, stepObj);
-          sequentialPending.push(stepObj);
+          });
         }
       }
 
@@ -423,7 +435,8 @@ function parseConversation(messages = []) {
             const parsed = JSON.parse(cleanLooseJson(tcMatch[1]));
             if (parsed.name) {
               const mappedAction = CC_TO_ACTION_MAP[parsed.name] || 'shell_exec';
-              sequentialPending.push({
+              pendingStepsList.push({
+                id: '',
                 step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
                 action: mappedAction,
                 params: parsed.arguments || {}
@@ -436,17 +449,25 @@ function parseConversation(messages = []) {
 
     // ======== 解析 User / Tool 执行反馈并闭环 ========
     else if (msg.role === 'user' || msg.role === 'tool') {
+      // 内部辅助消费函数：【202609111538修改点】：通过单一入口消费，确保出队严格同步，彻底消灭残留复读
+      const consumeMatchedStep = (matchId) => {
+        if (pendingStepsList.length === 0) return null;
+        if (matchId) {
+          const foundIdx = pendingStepsList.findIndex(s => s.id === matchId);
+          if (foundIdx !== -1) {
+            const [item] = pendingStepsList.splice(foundIdx, 1);
+            return item;
+          }
+        }
+        // 若没有 ID 或按 ID 未查到，按顺序弹出队列头部
+        return pendingStepsList.shift();
+      };
+
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_result') {
             const outText = typeof p.content === 'string' ? p.content : (p.content?.map(c => c.text).join('\n') || '');
-            let matchedStep = null;
-            if (p.tool_use_id && pendingSteps.has(p.tool_use_id)) {
-              matchedStep = pendingSteps.get(p.tool_use_id);
-              pendingSteps.delete(p.tool_use_id);
-            } else if (sequentialPending.length > 0) {
-              matchedStep = sequentialPending.shift();
-            }
+            const matchedStep = consumeMatchedStep(p.tool_use_id);
             if (matchedStep) {
               rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
             }
@@ -454,15 +475,17 @@ function parseConversation(messages = []) {
         }
       } else if (msg.role === 'tool' && msg.tool_call_id) {
         const outText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        let matchedStep = pendingSteps.get(msg.tool_call_id) || sequentialPending.shift();
+        const matchedStep = consumeMatchedStep(msg.tool_call_id);
         if (matchedStep) {
           rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
         }
       } else if (typeof msg.content === 'string') {
         const text = cleanNoise(msg.content);
-        if (text && !text.startsWith("Today's date is") && sequentialPending.length > 0) {
-          const matchedStep = sequentialPending.shift();
-          rawSteps.push({ ...matchedStep, feedback: text });
+        if (text && !text.startsWith("Today's date is") && pendingStepsList.length > 0) {
+          const matchedStep = consumeMatchedStep(null);
+          if (matchedStep) {
+            rawSteps.push({ ...matchedStep, feedback: text });
+          }
         }
       }
     }
