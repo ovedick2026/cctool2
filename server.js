@@ -7,7 +7,7 @@ import { Agent, setGlobalDispatcher } from 'undici';
 
 dotenv.config();
 
-// 1. 强制 IPv4 优先，并配置 undici 40分钟超长连接超时，杜绝 Node fetch 连接重置
+// 1. 网络配置：IPv4 优先，并配置 40 分钟超长超时，杜绝 Node fetch 重置连接
 dns.setDefaultResultOrder('ipv4first');
 setGlobalDispatcher(
   new Agent({
@@ -25,7 +25,7 @@ const PORT = Number(process.env.PORT || 7860);
 const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 
 // ==========================================
-// 1. 结构化日志模块 (仅打印增量，绝不刷屏)
+// 1. 结构化日志 (仅输出本次增量，杜绝刷屏)
 // ==========================================
 function getTimestamp() {
   return new Date().toISOString().replace('T', ' ').substring(0, 19);
@@ -55,8 +55,7 @@ function parseTargetUrl(req) {
   if (!/^https?:\/\//i.test(raw)) {
     try { raw = decodeURIComponent(raw); } catch {}
   }
-  
-  // 提取真正的上游 Base 和当前端点
+
   const v1Match = raw.match(/^(https?:\/\/[^\/]+(?:\/[^\/]+)*?)\/(v1\/(?:messages|chat\/completions|models|messages\/count_tokens))(?:\?(.*))?$/i);
   if (v1Match) {
     return {
@@ -109,7 +108,7 @@ const CC_TOOL_TO_ACTION = {
 };
 
 // ==========================================
-// 4. 深度噪音清洗与上下文压缩 (保留10轮)
+// 4. 上下文过滤与精细化压缩 (保留 10 轮)
 // ==========================================
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
@@ -125,7 +124,6 @@ function compressHistorySteps(rawSteps) {
   const trimmed = rawSteps.slice(-10);
   if (trimmed.length === 0) return '（当前为初始化阶段，尚无执行历史）';
 
-  // 标记文件最后读取索引
   const lastReadMap = new Map();
   trimmed.forEach((s, idx) => {
     if (s.action === 'fs_read' && s.params?.file_path) {
@@ -137,19 +135,16 @@ function compressHistorySteps(rawSteps) {
     let feedback = step.feedback || '[SUCCESS] 执行完成';
     let params = { ...step.params };
 
-    // 1. fs_write 脱敏
     if (step.action === 'fs_write') {
       const len = step.params?.content ? step.params.content.length : 0;
       params.content = `[源码文件已写入本地磁盘，大小: ${len} 字符]`;
     }
 
-    // 2. fs_replace 截断
     if (step.action === 'fs_replace') {
       if (params.old_string?.length > 80) params.old_string = params.old_string.slice(0, 30) + '...[略]...' + params.old_string.slice(-20);
       if (params.new_string?.length > 80) params.new_string = params.new_string.slice(0, 30) + '...[略]...' + params.new_string.slice(-20);
     }
 
-    // 3. fs_read 重复折叠
     if (step.action === 'fs_read') {
       const p = step.params?.file_path;
       if (lastReadMap.get(p) !== idx) {
@@ -159,7 +154,6 @@ function compressHistorySteps(rawSteps) {
       }
     }
 
-    // 4. shell_exec 智能截断 (错误高保真)
     if (step.action === 'shell_exec') {
       const hasErr = /error|fail|exit code [1-9]|command not found/i.test(feedback);
       if (!hasErr && feedback.length > 800) {
@@ -171,7 +165,11 @@ function compressHistorySteps(rawSteps) {
 
     return `--- Step ${idx + 1} ---
 【执行配置】：
-${JSON.stringify({ step_thought: step.step_thought, action: step.action, params }, null, 2)}
+【思考】: ${step.step_thought}
+【调度动作】: ${step.action}
+\`\`\`json
+${JSON.stringify(params, null, 2)}
+\`\`\`
 【本地执行反馈】：
 ${feedback}`;
   }).join('\n\n');
@@ -182,7 +180,6 @@ function parseConversation(messages = []) {
   const rawSteps = [];
   let latestTurnInput = null;
 
-  // 1. 深度寻找最原始的用户自然语言指令（跳过系统日期注入）
   for (const msg of messages) {
     if (msg.role === 'user') {
       let rawText = '';
@@ -193,8 +190,7 @@ function parseConversation(messages = []) {
         rawText = textItems.map(c => c.text).join('\n');
       }
       const clean = cleanNoise(rawText);
-      // 必须不是 tool_result 且有实质内容
-      if (clean && !clean.startsWith('<tool_result') && !clean.includes('Today\'s date is')) {
+      if (clean && !clean.startsWith('<tool_result') && !clean.includes("Today's date is")) {
         globalTask = clean;
         break;
       }
@@ -202,7 +198,6 @@ function parseConversation(messages = []) {
   }
 
   if (!globalTask) {
-    // 兜底：如果被 system-reminder 冲刷，提取最后一条包含实质性要求的信息
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg.role === 'user') {
@@ -217,7 +212,6 @@ function parseConversation(messages = []) {
 
   if (!globalTask) globalTask = '处理当前工作目录下的开发与代码任务。';
 
-  // 2. 提取最新一轮输入 (用于 DEBUG 展示)
   const lastMsg = messages[messages.length - 1];
   if (lastMsg) {
     if (typeof lastMsg.content === 'string') {
@@ -236,7 +230,6 @@ function parseConversation(messages = []) {
     }
   }
 
-  // 3. 抽取历史步骤
   let activeStep = null;
   for (const msg of messages) {
     const parts = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content }];
@@ -265,46 +258,48 @@ function parseConversation(messages = []) {
 }
 
 // ==========================================
-// 5. 提示词构建器 (抗风控 Pipeline 协议)
+// 5. 提示词构建器 (带强约束的返回格式模板)
 // ==========================================
 function buildPrompt(globalTask, historyLogsText) {
-  return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块（JSON 格式），由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
+  return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
 
-【Step 配置文件规范】：
-输出必须严格且仅包含在单一 \`\`\`json 代码块中，遵循以下结构：
-\`\`\`json
-{
-  "step_thought": "分析当前状态并说明该步骤的目的",
-  "action": "指令名称",
-  "params": { ... }
-}
-\`\`\`
-
-【流水线可用指令库（Action Library）】：
+【流水线可用指令库】：
 1. 文件与代码管理：
-   - fs_write: {"file_path": "路径", "content": "完整文本"}
-   - fs_read: {"file_path": "路径"}
-   - fs_replace: {"file_path": "路径", "old_string": "待换原文本", "new_string": "新文本"}
-   - notebook_patch: {"notebook_path": "路径", "cell_id": "单元格ID", "edit_mode": "replace|insert|delete", "new_source": "代码"}
+   - fs_write: {"file_path": "相对路径", "content": "写入的完整文本"}
+   - fs_read: {"file_path": "相对路径"}
+   - fs_replace: {"file_path": "相对路径", "old_string": "原文本", "new_string": "新文本"}
+   - notebook_patch: {"notebook_path": "路径", "cell_id": "ID", "edit_mode": "replace|insert|delete", "new_source": "代码"}
 2. 系统与环境交互：
    - shell_exec: {"command": "终端Shell命令"}
-   - user_prompt: {"question": "需用户决策的问题", "options": ["选项1", "选项2"]}
-   - git_worktree: {"action": "enter|exit", "path": "隔离工作区路径"}
+   - user_prompt: {"question": "需用户确认的问题", "options": ["选项1", "选项2"]}
+   - git_worktree: {"action": "enter|exit", "path": "目录路径"}
 3. 网络与知识检索：
    - net_search: {"query": "搜索词"}
    - net_fetch: {"url": "网址", "prompt": "提取目标"}
 4. 任务编排与治理：
    - task_entry: {"action": "create|update", "title": "任务名", "status": "pending|completed"}
    - subflow_spawn: {"title": "子任务名", "instructions": "分派执行说明"}
-   - code_audit: {"findings": [{"file": "文件", "summary": "问题描述", "verdict": "CONFIRMED"}]}
+   - code_audit: {"findings": [{"file": "文件", "summary": "问题", "verdict": "CONFIRMED"}]}
 5. 流程终结：
    - finish: {"summary": "全部流水线验收完成后的总结报告"}
 
-【流水线设计约束】：
-1. 拆解规范：当工作流初次启动（无历史记录）时，第一个步骤必须对任务进行极细致的拆解（具体到单文件、单页面或单步骤），输出一个 action 为 "fs_write" 的配置，将任务项全为 [ ] 的 todo.md 写入本地。
-2. 单步原则：为保证系统可控性，每个 JSON 只能描述当前唯一步骤的配置，不可合并多个步骤。
-3. 状态闭环：当外部反馈某个步骤已完成，后续应当安排配置将 todo.md 中对应项目更新为 [x]。
-4. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
+【流水线核心约束】：
+1. 规划优先：若工作流初次启动（无历史记录），第一步必须对任务做细致拆解，调度 fs_write 将任务项全为 [ ] 的 todo.md 写入本地。
+2. 单步原子性：单次回复有且仅能包含 1 个工具动作！严禁合并多个动作。
+3. 状态闭环：当外部日志提示某子任务已完成，后续应当安排 fs_replace 将 todo.md 中对应项目标记为 [x]。
+4. 终止条件：当且仅当所有待办项均已完成验收时，调度动作输出为 finish。
+
+=======================================================
+【必须严格遵守的响应格式模板】：
+你的每次回复必须严格按照以下三段式结构输出，严禁随意增删格式：
+
+【思考】: 简要分析当前执行状态以及下一步骤的具体意图。
+【调度动作】: 指令名称（例如 fs_write，必须完全匹配上方指令库）
+\`\`\`json
+{
+  ...参数内容...
+}
+\`\`\`
 
 =======================================================
 【全局目标任务】：
@@ -316,76 +311,142 @@ ${historyLogsText}
 
 =======================================================
 【当前调度决策】：
-请综合【全局目标任务】与【历史执行记录】，评估当前阶段并输出下一步操作：
-- 若尚未初始化，输出生成详尽 todo.md 的单一配置。
-- 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
-- 若所有项已全部完成，输出 finish 配置。
-
-请输出当前步骤的配置 JSON：`;
+请综合【全局目标任务】与【历史执行记录】，严格按照上述【响应格式模板】输出下一步操作：`;
 }
 
 // ==========================================
-// 6. 工业级鲁棒 JSON / 括号平衡提取器
+// 6. 核心双模解析器：将模型输出转换为 CC 工具协议
 // ==========================================
-function extractActionJson(rawText) {
-  if (!rawText || typeof rawText !== 'string') return null;
+function parseModelOutput(rawText) {
+  if (!rawText || typeof rawText !== 'string') {
+    return { thought: '', action: null, params: {}, isFinish: true };
+  }
 
-  // 1. 尝试 Markdown json 代码块
-  const mdMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  if (mdMatch) {
+  let thought = '';
+  let action = null;
+  let params = {};
+
+  // 1. 优先提取标准【思考】段
+  const thoughtMatch = rawText.match(/【思考】\s*[:：]?\s*([\s\S]*?)(?=【调度动作】|```json|```|$)/i);
+  if (thoughtMatch) {
+    thought = thoughtMatch[1].trim();
+  }
+
+  // 2. 提取【调度动作】
+  const actionMatch = rawText.match(/【调度动作】\s*[:：]?\s*([a-zA-Z0-9_]+)/i) ||
+                      rawText.match(/(?:^|\n)\s*(?:action|调度动作)\s*[:：]?\s*["']?([a-zA-Z0-9_]+)["']?/i);
+  if (actionMatch) {
+    action = actionMatch[1].trim();
+  }
+
+  // 3. 提取 ```json 代码块中的参数对象
+  const jsonMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  let parsedJson = null;
+
+  if (jsonMatch) {
     try {
-      return JSON.parse(cleanLooseJsonString(mdMatch[1]));
+      parsedJson = JSON.parse(jsonMatch[1].replace(/,\s*([}\]])/g, '$1').replace(/\r\n/g, '\n'));
     } catch {}
   }
 
-  // 2. 深度扫描：括号平衡提取对象切片
-  let depth = 0;
-  let inStr = false;
-  let quoteChar = '';
-  let escape = false;
-  let startIdx = -1;
-
-  for (let i = 0; i < rawText.length; i++) {
-    const ch = rawText[i];
-    if (inStr) {
-      if (escape) escape = false;
-      else if (ch === '\\') escape = true;
-      else if (ch === quoteChar) inStr = false;
-      continue;
-    }
-
-    if (ch === '"' || ch === "'") {
-      inStr = true;
-      quoteChar = ch;
-    } else if (ch === '{') {
-      if (depth === 0) startIdx = i;
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0 && startIdx !== -1) {
-        const slice = rawText.slice(startIdx, i + 1);
-        try {
-          const parsed = JSON.parse(cleanLooseJsonString(slice));
-          if (parsed && typeof parsed === 'object' && (parsed.action || parsed.step_thought)) {
-            return parsed;
-          }
-        } catch {}
-        startIdx = -1;
-      }
+  // 如果上面没提取到，兜底提取大括号对象
+  if (!parsedJson) {
+    const braceMatch = rawText.match(/\{[\s\S]*\}/);
+    if (braceMatch) {
+      try {
+        parsedJson = JSON.parse(braceMatch[0].replace(/,\s*([}\]])/g, '$1'));
+      } catch {}
     }
   }
 
-  return null;
+  if (parsedJson && typeof parsedJson === 'object') {
+    // 兼容模型输出完整单一 JSON 结构的情况
+    if (!action && parsedJson.action) {
+      action = parsedJson.action;
+    }
+    if (!thought && (parsedJson.step_thought || parsedJson.thought)) {
+      thought = parsedJson.step_thought || parsedJson.thought;
+    }
+    if (parsedJson.params && typeof parsedJson.params === 'object') {
+      params = parsedJson.params;
+    } else {
+      const { action: _a, step_thought: _st, thought: _th, ...rest } = parsedJson;
+      params = rest;
+    }
+  }
+
+  // 如果没有提取到任何 thought，以代码块前的非空文本作为 thought
+  if (!thought) {
+    const cutPos = rawText.indexOf('```');
+    thought = cutPos > 0 ? rawText.slice(0, cutPos).replace(/【调度动作】.*$/m, '').trim() : rawText.trim();
+  }
+
+  const isFinish = !action || action === 'finish';
+  return { thought, action, params, isFinish };
 }
 
-function cleanLooseJsonString(str) {
-  return str
-    .replace(/,\s*([}\]])/g, '$1') // 移除尾随逗号
-    .replace(/\r\n/g, '\n');
+// 规范化并映射为 Claude Code 原生入参
+function normalizeCcToolCall(action, params) {
+  const ccTool = ACTION_TO_CC_TOOL[action] || 'Bash';
+  let input = { ...params };
+
+  switch (ccTool) {
+    case 'Write':
+      input = {
+        file_path: params.file_path || params.path || '',
+        content: params.content !== undefined ? params.content : (params.text || '')
+      };
+      break;
+    case 'Read':
+      input = {
+        file_path: params.file_path || params.path || ''
+      };
+      break;
+    case 'Edit':
+      input = {
+        file_path: params.file_path || params.path || '',
+        old_string: params.old_string || params.old_str || '',
+        new_string: params.new_string || params.new_str || ''
+      };
+      break;
+    case 'Bash':
+      input = {
+        command: params.command || params.cmd || ''
+      };
+      break;
+    case 'AskUserQuestion':
+      if (!input.questions) {
+        input = {
+          questions: [
+            {
+              question: params.question || '请确认',
+              header: '用户决策',
+              multiSelect: false,
+              options: (params.options || ['确认', '取消']).map(o => typeof o === 'string' ? { label: o, description: o } : o)
+            }
+          ]
+        };
+      }
+      break;
+    case 'Agent':
+      input = {
+        description: params.description || '',
+        prompt: params.prompt || params.instructions || ''
+      };
+      break;
+    case 'TaskCreate':
+      input = {
+        subject: params.title || params.subject || '',
+        description: params.description || ''
+      };
+      break;
+  }
+
+  return { ccTool, input };
 }
 
 // ==========================================
-// 7. 上游 SSE 流式读取解析器 (永不超时的核心)
+// 7. 上游 SSE 流式通信核心
 // ==========================================
 async function* readSSE(response) {
   const reader = response.body.getReader();
@@ -416,18 +477,17 @@ async function* readSSE(response) {
   }
 }
 
-// 向上游发起纯流式请求，边读边提取，支持 Thinking 流式广播
 async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinkingChunk) {
   const headers = {
     'Content-Type': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Authorization': `Bearer ${apiKey}`,
     'x-api-key': apiKey,
     'anthropic-version': '2023-06-01',
     'Accept': 'text/event-stream, application/json'
   };
 
-  // 1. 尝试 Anthropic /v1/messages (stream: true)
+  // 1. 尝试 Anthropic /v1/messages
   try {
     const res = await fetch(`${targetBase}/v1/messages`, {
       method: 'POST',
@@ -461,10 +521,10 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
       return { text: fullText, thinking: thinkingText };
     }
   } catch (err) {
-    logger.debug('上游 messages 流式连接异常，切换 chat/completions', err.message);
+    logger.debug('Anthropic 协议流式尝试未果，自动切换 chat/completions', err.message);
   }
 
-  // 2. 回退尝试 OpenAI /v1/chat/completions (stream: true)
+  // 2. 回退尝试 OpenAI /v1/chat/completions
   const chatRes = await fetch(`${targetBase}/v1/chat/completions`, {
     method: 'POST',
     headers,
@@ -477,7 +537,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 
   if (!chatRes.ok) {
     const errText = await chatRes.text();
-    throw new Error(`上游调用完全失败: HTTP ${chatRes.status} - ${errText}`);
+    throw new Error(`上游调用失败: HTTP ${chatRes.status} - ${errText}`);
   }
 
   let fullText = '';
@@ -491,19 +551,17 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
       const delta = payload.choices?.[0]?.delta;
       if (!delta) continue;
 
-      // 提取原生思考 (DeepSeek/GLM)
       const think = delta.reasoning_content || delta.reasoning || '';
       if (think) {
         thinkingText += think;
         if (onThinkingChunk) onThinkingChunk(think);
       }
 
-      // 提取正文并解析可能内嵌的<think>标签
       if (delta.content) {
         let piece = delta.content;
         while (piece.length > 0) {
           if (!inThinkTag) {
-            const start = piece.indexOf('');
+            const start = piece.indexOf('<think>');
             if (start !== -1) {
               fullText += piece.slice(0, start);
               inThinkTag = true;
@@ -513,7 +571,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
               piece = '';
             }
           } else {
-            const end = piece.indexOf('<think>');
+            const end = piece.indexOf('</think>');
             if (end !== -1) {
               const tPiece = piece.slice(0, end);
               thinkingText += tPiece;
@@ -535,12 +593,10 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 }
 
 // ==========================================
-// 8. 路由: GET */v1/models (模型列表透传)
+// 8. 路由: GET */v1/models
 // ==========================================
 app.get(/(.*)\/v1\/models$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
-  logger.debug('拉取模型列表', { 目标上游: upstreamBase });
-
   try {
     const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
     const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
@@ -560,7 +616,7 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
 });
 
 // ==========================================
-// 9. 路由: POST */v1/messages/count_tokens (CC必须端点)
+// 9. 路由: POST */v1/messages/count_tokens
 // ==========================================
 app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
   const bodyText = JSON.stringify(req.body || {});
@@ -569,7 +625,7 @@ app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
 });
 
 // ==========================================
-// 10. 路由: POST */v1/messages (Claude Code 主交互入口)
+// 10. 路由: POST */v1/messages (Claude Code 适配核心)
 // ==========================================
 app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const startTime = Date.now();
@@ -578,7 +634,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const { model, messages, stream } = req.body;
 
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
-  logger.debug('收到 Claude Code 调度请求', {
+  logger.debug('收到 Claude Code 请求', {
     目标上游: upstreamBase,
     模型: model,
     本次增量输入: latestTurnInput || '（初始启动任务）'
@@ -593,14 +649,13 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
-  // 1. 如果客户端要求流式，立即握手建立 SSE 并启动保活
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
-    // 立即下发 message_start，杜绝客户端 30 秒超时
+    // 立即握手，防止客户端超时
     sendSSE('message_start', {
       type: 'message_start',
       message: {
@@ -623,7 +678,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   try {
     const prompt = buildPrompt(globalTask, historyLogsText);
 
-    // 回调：实时下发 Thinking 内容给 Claude Code
     const onThinkingChunk = (chunk) => {
       if (!stream || !chunk) return;
       if (!thinkingStarted) {
@@ -641,7 +695,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       });
     };
 
-    // 向上游流式拉取完整响应
     const { text: assistantText, thinking } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
@@ -652,40 +705,43 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
-    // 关闭 thinking block
     if (stream && thinkingStarted) {
       sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
       blockIndex++;
     }
 
-    // 解析出动作与参数
-    const actionObj = extractActionJson(assistantText);
+    // 【关键】：使用重构后的双模解析器提取调度信息
+    const { thought, action, params, isFinish } = parseModelOutput(assistantText);
     const toolCallId = 'call_' + crypto.randomBytes(8).toString('hex');
-    let stopReason = 'end_turn';
-    let responseBlocks = [];
 
-    if (actionObj && actionObj.action && actionObj.action !== 'finish') {
-      const ccTool = ACTION_TO_CC_TOOL[actionObj.action] || 'Bash';
+    let responseBlocks = [];
+    let stopReason = 'end_turn';
+
+    if (!isFinish && action) {
+      // 成功解析出工具调用：映射为 Claude Code 原生协议
+      const { ccTool, input } = normalizeCcToolCall(action, params);
       stopReason = 'tool_use';
+
       responseBlocks = [
-        { type: 'text', text: actionObj.step_thought || `调度 ${ccTool}...` },
-        { type: 'tool_use', id: toolCallId, name: ccTool, input: actionObj.params || {} }
+        { type: 'text', text: thought || `调度 ${ccTool}...` },
+        { type: 'tool_use', id: toolCallId, name: ccTool, input }
       ];
 
-      logger.debug('成功编译工具调度', {
+      logger.debug('成功编译并下发 CC 原生工具', {
         耗时: `${Date.now() - startTime}ms`,
-        思考: actionObj.step_thought,
+        正文思考: thought,
         下发工具: ccTool,
-        参数: actionObj.params
+        转换参数: input
       });
     } else {
-      const summary = actionObj?.params?.summary || assistantText;
-      responseBlocks = [{ type: 'text', text: summary }];
+      // 流程终结或纯文本
+      const finalText = params.summary || thought || assistantText;
+      responseBlocks = [{ type: 'text', text: finalText }];
       stopReason = 'end_turn';
 
-      logger.debug('流程终结或纯文本', {
+      logger.debug('任务终结总结', {
         耗时: `${Date.now() - startTime}ms`,
-        总结: summary.slice(0, 150)
+        总结文本: finalText.slice(0, 150)
       });
     }
 
@@ -723,7 +779,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       sendSSE('message_stop', { type: 'message_stop' });
       res.end();
     } else {
-      // 非流式响应
       const content = [];
       if (thinking) content.push({ type: 'thinking', thinking });
       content.push(...responseBlocks);
@@ -741,14 +796,14 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('Claude Code 消息通道异常', err.message);
+    logger.error('Claude Code 处理链路异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
 });
 
 // ==========================================
-// 11. 路由: POST */v1/chat/completions (OpenWebUI 入口)
+// 11. 路由: POST */v1/chat/completions (OpenWebUI 适配通道)
 // ==========================================
 app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const startTime = Date.now();
@@ -786,13 +841,14 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
-    const actionObj = extractActionJson(assistantText);
+    const { thought, action, params, isFinish } = parseModelOutput(assistantText);
     let finalOutput = assistantText;
-    if (actionObj && actionObj.action) {
-      finalOutput = `【思考】: ${actionObj.step_thought || ''}\n【调度动作】: ${actionObj.action}\n\`\`\`json\n${JSON.stringify(actionObj.params, null, 2)}\n\`\`\``;
+
+    if (!isFinish && action) {
+      finalOutput = `【思考】: ${thought}\n【调度动作】: ${action}\n\`\`\`json\n${JSON.stringify(params, null, 2)}\n\`\`\``;
     }
 
-    logger.debug('OpenWebUI 响应完成', { 耗时: `${Date.now() - startTime}ms` });
+    logger.debug('OpenWebUI 响应就绪', { 耗时: `${Date.now() - startTime}ms` });
 
     if (stream) {
       res.write(`data: ${JSON.stringify({ id: 'chatcmpl-1', choices: [{ delta: { content: finalOutput, reasoning_content: thinking } }] })}\n\n`);
@@ -809,16 +865,17 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('OpenWebUI 消息通道异常', err.message);
+    logger.error('OpenWebUI 处理异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
 });
 
-// 解除 Node.js 服务端自身的默认 5 分钟超时限制
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(` 工业级全功能 CC 中介已启动 (监听端口: ${PORT})`);
+  console.log(` CC Web 全功能中介代理已启动 (端口: ${PORT})`);
+  console.log(` 调试模式: ${IS_DEBUG ? '开启 (DEBUG=true)' : '关闭 (仅错误日志)'}`);
+  console.log(` 状态: 双模解析器已载入，工具调用将精准转换为原生 CC 格式`);
   console.log(`======================================================\n`);
 });
 
