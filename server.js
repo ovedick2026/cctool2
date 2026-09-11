@@ -200,55 +200,111 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 对话历史解析与智能压缩引擎（【本次修改】：彻底斩断思考回声，纯净动作与反馈映射）
+// 4. 对话历史解析与智能压缩引擎（完整稳定版）
 // ==========================================
-function cleanNoise(text) {
+
+// 【本次修改】：定义严格的核心文档正则，兼顾各种大小写（README/TODO）并防止 autodoc 等子串误伤
+const CORE_DOCS_REGEX = /(?:^|[/\s"'\`\\])(?:todo|readme)\.(?:md|markdown|txt)(?:[/\s"'\`\\]|$)/i;
+
+function sanitizeWhitespace(text) {
   if (!text || typeof text !== 'string') return '';
   return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function cleanNoise(text) {
+  if (!text || typeof text !== 'string') return '';
+  const cleaned = text
     .replace(/REMINDER:\s*You MUST include the sources[\s\S]*?hyperlinks\./gi, '')
     .replace(/Wasted call\s*—\s*file unchanged[\s\S]*?instead\./gi, '[SUCCESS] 文件未修改，状态已是最新。')
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
     .replace(/<total_tokens>[\s\S]*?<\/total_tokens>/gi, '')
     .replace(/<task-notification>[\s\S]*?<\/task-notification>/gi, '')
-    .replace(/<context>[\s\S]*?<\/context>/gi, '')
-    .trim();
+    .replace(/<context>[\s\S]*?<\/context>/gi, '');
+  return sanitizeWhitespace(cleaned);
 }
 
-// 格式化输出本地执行反馈，防超长溢出并对 todo.md 提供内容保护
-function formatLocalFeedback(str, actionName, isTodoFile = false) {
-  if (!str) return '[SUCCESS] 操作已执行完成';
-  let text = String(str).trim();
+// 【本次修改】：日志中间智能折叠，保留前后文的同时提取报错行
+function smartTruncateLog(text, limit, label = '终端日志') {
+  if (text.length <= limit) return text;
 
-  // 若终端反馈已明确成功但缺少 [SUCCESS] 标记，予以补齐
+  const headSize = Math.max(500, Math.floor(limit * 0.35));
+  const tailSize = Math.max(600, Math.floor(limit * 0.45));
+
+  const headPart = text.slice(0, headSize);
+  const tailPart = text.slice(-tailSize);
+  const middleContent = text.slice(headSize, -tailSize);
+
+  const lines = middleContent.split('\n');
+  const errorIndicators = [/error/i, /exception/i, /fail/i, /traceback/i, /exit code\s*[1-9]/i, /cannot access/i, /no such file/i];
+  const capturedLines = [];
+
+  for (let i = 0; i < lines.length && capturedLines.length < 25; i++) {
+    if (errorIndicators.some(reg => reg.test(lines[i]))) {
+      capturedLines.push(lines[i].trim());
+    }
+  }
+
+  const removed = text.length - headSize - tailSize;
+  let summary = `\n...[${label}中间输出已折叠 ${removed} 字符`;
+  if (capturedLines.length > 0) {
+    summary += `，提取关键异常信号：\n${capturedLines.slice(0, 8).join('\n')}\n...折叠结束]...\n`;
+  } else {
+    summary += `]...\n`;
+  }
+
+  return `${headPart}${summary}${tailPart}`;
+}
+
+// 【本次修改】：formatLocalFeedback 重构，保护 todo.md/readme.md/待办打勾条目不被腰斩
+function formatLocalFeedback(str, actionName, stepParams = {}, isLatestStep = false, stepAge = 0) {
+  if (!str) return '[SUCCESS] 操作已执行完成';
+  let text = sanitizeWhitespace(String(str));
+
   if (/successfully|created|updated|done|completed/i.test(text) && !text.startsWith('[')) {
     text = `[SUCCESS] ${text}`;
   }
 
-  // 如果是 todo.md 相关操作，完整保留其读写反馈，确保状态链完整
-  if (isTodoFile) {
-    return text;
+  const cmdStr = String(stepParams.command || stepParams.cmd || '');
+  const pathStr = String(stepParams.file_path || stepParams.path || '');
+
+  // 判定是否为核心文档读取或带待办清单语法 (- [ ] / - [x])
+  const isTargetDocFile = CORE_DOCS_REGEX.test(pathStr) || CORE_DOCS_REGEX.test(cmdStr);
+  const hasChecklistMarks = /- \[[ xX]\]/m.test(text);
+  const isDocContext = isTargetDocFile || hasChecklistMarks;
+
+  // 核心文档/待办清单给予 20,000 字符超高预算，确保清单不被腰斩
+  if (isDocContext) {
+    if (text.length <= 20000) return text;
+    return smartTruncateLog(text, 20000, '核心任务/设计文档');
+  }
+
+  // 梯度动态预算：最新步（Tier 1）15000 字符，近序步 6000 字符，远期步 2500 字符
+  let budget = 3000;
+  if (isLatestStep) {
+    budget = 15000;
+  } else if (stepAge <= 2) {
+    budget = 6000;
+  } else {
+    budget = 2500;
   }
 
   if (actionName === 'fs_read') {
-    return text;
+    if (text.length > budget) return smartTruncateLog(text, budget, '文件读取');
   } else if (actionName === 'shell_exec' || actionName === 'Bash') {
-    const hasErr = /error|fail|exit code [1-9]|command not found|cannot access|No such file/i.test(text);
-    if (!hasErr && text.length > 1200) {
-      return text.slice(0, 400) + `\n...[输出流水折叠 ${text.length - 800} 字符]...\n` + text.slice(-400);
-    } else if (hasErr && text.length > 3500) {
-      return text.slice(-3500);
-    }
-  } else if (actionName !== 'fs_write' && text.length > 2000) {
-    return text.slice(0, 1000) + '\n...[略]...\n' + text.slice(-600);
+    if (text.length > budget) return smartTruncateLog(text, budget, '命令输出');
+  } else if (actionName !== 'fs_write' && text.length > budget) {
+    return smartTruncateLog(text, budget, '执行反馈');
   }
+
   return text;
 }
 
-/* 【本次修改 1】：彻底重构 compressHistorySteps
-   - 彻底删除【执行配置】中的 step_thought / action_summary 字段！
-   - 参考 adapt.js 核心设计：历史只保留客观事实（Action + Params + Result），坚决不向历史注入思维链。
-   - 这从物理上根除了“每一轮都复读第一步初始化思考”的问题。
-*/
+// 【本次修改】：彻底移除执行配置中的 step_thought，杜绝模型复读第一步思维；支持核心文档写入保护
 function compressHistorySteps(rawSteps) {
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
   const trimmed = validSteps.slice(-6);
@@ -259,23 +315,39 @@ function compressHistorySteps(rawSteps) {
   const lastReadMap = new Map();
   trimmed.forEach((s, idx) => {
     if (s.action === 'fs_read' && s.params?.file_path) {
-      lastReadMap.set(s.params.file_path, idx);
+      lastReadMap.set(String(s.params.file_path).toLowerCase(), idx);
     }
   });
+
+  const total = trimmed.length;
 
   return trimmed.map((step, idx) => {
     let feedback = step.feedback || '[SUCCESS] 执行完成';
     let params = { ...step.params };
     const filePathStr = String(params.file_path || params.path || '');
-    const isTodoFile = filePathStr === 'todo.md' || filePathStr.endsWith('/todo.md');
 
-    // 1. fs_write 参数处理
+    // 大小写不敏感识别
+    const isTodoFile = /(?:^|[/\\])todo\.(?:md|markdown|txt)$/i.test(filePathStr);
+    const isReadmeFile = /(?:^|[/\\])readme\.(?:md|markdown|txt)$/i.test(filePathStr);
+
+    const stepAge = total - 1 - idx;
+    const isLatestStep = stepAge === 0;
+
+    // 1. fs_write 参数骨架化
     if (step.action === 'fs_write') {
       if (isTodoFile) {
+        // todo.md 完整保留，供后续打勾参考
         params = {
           file_path: params.file_path || 'todo.md',
           content: step.params?.content || ''
         };
+      } else if (isReadmeFile) {
+        const contentStr = String(step.params?.content || '');
+        if (contentStr.length <= 4000) {
+          params = { file_path: params.file_path || 'readme.md', content: contentStr };
+        } else {
+          params = { file_path: params.file_path || 'readme.md', content: `[项目规划与设计规范已写入，共 ${contentStr.length} 字符]` };
+        }
       } else {
         const len = step.params?.content ? String(step.params.content).length : 0;
         params = { file_path: params.file_path || 'file' };
@@ -285,31 +357,31 @@ function compressHistorySteps(rawSteps) {
       }
     }
 
-    // 2. fs_replace 参数处理
+    // 2. fs_replace 参数精简
     if (step.action === 'fs_replace') {
-      if (!isTodoFile) {
-        if (params.old_string?.length > 80) {
-          params.old_string = params.old_string.slice(0, 30) + '...[略]...' + params.old_string.slice(-20);
+      if (!isTodoFile && !isReadmeFile) {
+        if (params.old_string?.length > 100) {
+          params.old_string = params.old_string.slice(0, 40) + '...[略]...' + params.old_string.slice(-30);
         }
-        if (params.new_string?.length > 80) {
-          params.new_string = params.new_string.slice(0, 30) + '...[略]...' + params.new_string.slice(-20);
+        if (params.new_string?.length > 100) {
+          params.new_string = params.new_string.slice(0, 40) + '...[略]...' + params.new_string.slice(-30);
         }
       }
     }
 
-    // 3. fs_read 反馈处理
+    // 3. fs_read 重复读取折叠
     if (step.action === 'fs_read') {
-      const p = step.params?.file_path;
-      if (lastReadMap.get(p) !== idx) {
-        feedback = `[早期版本已读取，第 ${lastReadMap.get(p) + 1} 步有最新读取结果，此处折叠]`;
+      const lowerPath = filePathStr.toLowerCase();
+      if (lastReadMap.get(lowerPath) !== idx) {
+        feedback = `[早期版本已读取，第 ${lastReadMap.get(lowerPath) + 1} 步有最新读取结果，此处折叠]`;
       } else {
-        feedback = formatLocalFeedback(feedback, 'fs_read', isTodoFile);
+        feedback = formatLocalFeedback(feedback, 'fs_read', params, isLatestStep, stepAge);
       }
     } else {
-      feedback = formatLocalFeedback(feedback, step.action, isTodoFile);
+      feedback = formatLocalFeedback(feedback, step.action, params, isLatestStep, stepAge);
     }
 
-    /* 【本次修改】：【执行配置】只输出纯净、合法的 action 与 params，杜绝一切模型历史文本注入 */
+    // 【核心改动】：仅保留 action 与 params，绝不输出任何 step_thought
     return `--- Step ${idx + 1} ---
 【执行配置】：
 ${JSON.stringify({
@@ -321,10 +393,7 @@ ${feedback}`;
   }).join('\n\n');
 }
 
-/* 【本次修改 2】：重构 parseConversation
-   - 参考 adapt.js 对 Claude Code 协议的处理方式，基于 tool_use_id 构建单向严格对应映射。
-   - 不再尝试跨轮保留或拼接任何自然语言 thought，从输入源头切断“第一步文本溢出到后续轮次”。
-*/
+// 【本次修改】：单一队列同步解析，彻底防止多轮步骤与反馈错位
 function parseConversation(messages = []) {
   let globalTask = '';
   const rawSteps = [];
@@ -337,7 +406,7 @@ function parseConversation(messages = []) {
     ReportFindings: 'code_audit'
   };
 
-  // 1. 提取全局初始目标（取首条真实用户指令）
+  // 1. 提取全局任务
   for (const msg of messages) {
     if (msg.role === 'user') {
       let rawText = '';
@@ -352,18 +421,16 @@ function parseConversation(messages = []) {
       }
     }
   }
-  if (!globalTask) globalTask = '推进当前目录的todo.md并完成项目构建。';
+  if (!globalTask) globalTask = '推进当前工作目录下的任务推进。';
 
-  // 2. 状态机：成对解析 Claude Code 的 tool_use 和 tool_result
+  // 2. 状态机解析
   const pendingSteps = new Map();
   const sequentialQueue = [];
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
 
-    // ======== 解析 Assistant 调度动作 ========
     if (msg.role === 'assistant') {
-      // A. Anthropic 原生 tool_use 数组（Claude Code 核心通道）
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_use') {
@@ -379,7 +446,6 @@ function parseConversation(messages = []) {
         }
       }
 
-      // B. OpenAI 兼容 tool_calls
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
           const fnName = tc.function?.name || '';
@@ -400,7 +466,6 @@ function parseConversation(messages = []) {
         }
       }
 
-      // C. 文本标签容错
       if (typeof msg.content === 'string' && msg.content.includes('<tool_call>')) {
         const tcMatch = msg.content.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i);
         if (tcMatch) {
@@ -408,26 +473,20 @@ function parseConversation(messages = []) {
             const parsed = JSON.parse(cleanLooseJson(tcMatch[1]));
             if (parsed.name) {
               const mappedAction = CC_TO_ACTION_MAP[parsed.name] || 'shell_exec';
-              const stepObj = {
+              sequentialQueue.push({
                 id: '',
                 action: mappedAction,
                 params: parsed.arguments || {}
-              };
-              sequentialQueue.push(stepObj);
+              });
             }
           } catch {}
         }
       }
-    }
-
-    // ======== 解析 User / Tool 执行反馈并闭环 ========
-    else if (msg.role === 'user' || msg.role === 'tool') {
-      // 消费匹配函数：严格保持单步出队，消除内存错位
+    } else if (msg.role === 'user' || msg.role === 'tool') {
       const matchAndPopStep = (toolCallId) => {
         if (toolCallId && pendingSteps.has(toolCallId)) {
           const step = pendingSteps.get(toolCallId);
           pendingSteps.delete(toolCallId);
-          // 同时从排队序列中移除，保持状态一致
           const qIdx = sequentialQueue.findIndex(s => s.id === toolCallId);
           if (qIdx !== -1) sequentialQueue.splice(qIdx, 1);
           return step;
@@ -823,14 +882,23 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
   });
 });
 
+// 【本次修改】：设置安全上限（≤10000），防止 Claude Code 客户端计算超标触发本地“Prompt is too long”
 app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
-  // 必须返回安全范围内的 token 数（防止 Claude Code 客户端因本地计算超标直接阻断并报 Prompt is too long）
   const bodyText = JSON.stringify(req.body || {});
   const rawTokens = Math.ceil(bodyText.length / 4);
-  // 压制在 15,000 以内，确保 Claude Code 永远认为 prompt 在健康窗口内
-  const safeTokens = Math.min(rawTokens, 12000);
+  const safeTokens = Math.min(rawTokens, 10000);
   res.json({ input_tokens: safeTokens });
 });
+
+// 【本次修改】：判定是否为 Claude Code 触发的会话自动压缩/摘要请求
+function isCompactionRequest(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const lastMsg = messages[messages.length - 1];
+  const content = typeof lastMsg.content === 'string' 
+    ? lastMsg.content 
+    : (Array.isArray(lastMsg.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
+  return /summary of the conversation so far|summarize the conversation|compact|create a detailed summary/i.test(content);
+}
 
 // ==========================================
 // 9. 核心路由: POST */v1/messages (Claude Code 主通道)
@@ -840,17 +908,21 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
   const { model, messages, stream } = req.body;
+
+  // 【本次修改】：识别压缩请求，确保 CC 自动瘦身流程正常执行
+  const isCompacting = isCompactionRequest(messages);
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
+  
   logger.debug('收到 Claude Code 调度请求', {
     '目标上游': upstreamBase,
     '模型': model,
+    '压缩模式': isCompacting ? '是 (Compaction)' : '否',
     '本次增量输入': latestTurnInput || '（初始启动任务）'
   });
 
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
   let heartbeatTimer = null;
   let blockIndex = 0;
-  let thinkingStarted = false;
 
   const sendSSE = (ev, data) => {
     if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -880,26 +952,17 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   }
 
   try {
-    const prompt = buildPrompt(globalTask, historyLogsText);
-    const onThinkingChunk = (chunk) => {
-      // 保持静默，不把上游的思维链回传给客户端，防止膨胀
-      // if (!stream || !chunk) return;
-      // if (!thinkingStarted) {
-      //   sendSSE('content_block_start', {
-      //     type: 'content_block_start',
-      //     index: blockIndex,
-      //     content_block: { type: 'thinking', thinking: '' }
-      //   });
-      //   thinkingStarted = true;
-      // }
-      // sendSSE('content_block_delta', {
-      //   type: 'content_block_delta',
-      //   index: blockIndex,
-      //   delta: { type: 'thinking_delta', thinking: chunk }
-      // });
-    };
+    let prompt = '';
+    if (isCompacting) {
+      prompt = `请对以下任务流水线当前的历史进展提供一份结构化、简明扼要的摘要总结，包括：已完成的步骤、生成的文件清单、以及当前待推进的下一个阶段。请直接给出总结文本：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`;
+    } else {
+      prompt = buildPrompt(globalTask, historyLogsText);
+    }
 
-    const { text: assistantText, thinking } = await fetchUpstreamStream(
+    // 【本次修改】：彻底关闭向 Claude Code 下发 thinking SSE，避免数万字符累积撑爆客户端上下文
+    const onThinkingChunk = null;
+
+    const { text: assistantText } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
@@ -908,43 +971,47 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     );
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    // thinkingStarted 相关的 sendSSE 彻底移除
-    // if (stream && thinkingStarted) {
-    //   sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-    //   blockIndex++;
-    // }
 
-    // 解析动作
-    const parsedAction = extractActionAndThought(assistantText);
     let stopReason = 'end_turn';
     let textContent = '';
     let toolBlock = null;
 
-    if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
-      stopReason = 'tool_use';
-      // textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
-      // 只给客户端返回简短状态（例如 50 字以内），绝不把成千上万字的解析长文回传给客户端塞入历史
-      textContent = `正在推进：调度 ${mappedTool.name} 处理相关操作...`;
-      toolBlock = {
-        type: 'tool_use',
-        id: 'toolu_' + crypto.randomBytes(10).toString('hex'),
-        name: mappedTool.name,
-        input: mappedTool.arguments
-      };
-      logger.debug('成功装配 CC 原生工具调用', {
-        '耗时': `${Date.now() - startTime}ms`,
-        // '思考内容': textContent,
-        '下发原生工具': mappedTool.name,
-        '工具参数': mappedTool.arguments
-      });
-    } else {
-      textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
+    if (isCompacting) {
+      // 压缩模式：返回纯文本，让 CC 顺利完成本地上下文归档
+      textContent = assistantText.replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '').trim() || '流水线历史状态已压缩归纳。';
       stopReason = 'end_turn';
+    } else {
+      // 正常执行模式：解析动作
+      const parsedAction = extractActionAndThought(assistantText);
+
+      if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
+        const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+        stopReason = 'tool_use';
+        
+        // 【本次修改】：下发给客户端的提示文本压制在单句，杜绝把万字长文回塞客户端历史
+        const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
+        textContent = `调度 ${mappedTool.name} ${targetDesc ? '-> ' + targetDesc : ''}`.slice(0, 80);
+
+        toolBlock = {
+          type: 'tool_use',
+          id: 'toolu_' + crypto.randomBytes(10).toString('hex'),
+          name: mappedTool.name,
+          input: mappedTool.arguments
+        };
+
+        logger.debug('成功装配 CC 原生工具调用', {
+          '耗时': `${Date.now() - startTime}ms`,
+          '下发原生工具': mappedTool.name,
+          '参数大小': `${JSON.stringify(mappedTool.arguments).length} 字符`
+        });
+      } else {
+        textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
+        stopReason = 'end_turn';
+      }
     }
 
     if (stream) {
-      // 1. 发送【思考】文本块 (index: 0 或 1)
+      // 1. 发送精炼说明文本
       if (textContent) {
         sendSSE('content_block_start', {
           type: 'content_block_start',
@@ -960,7 +1027,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         blockIndex++;
       }
 
-      // 2. 发送【工具调用】原生结构块 (严格符合 Anthropic Messages 协议)
+      // 2. 发送工具调用块
       if (toolBlock) {
         sendSSE('content_block_start', {
           type: 'content_block_start',
@@ -984,7 +1051,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         blockIndex++;
       }
 
-      // 3. 发送带 tool_use 状态的 message_delta (通知终端立即拦截执行工具)
+      // 3. 发送 message_delta 结束本轮
       sendSSE('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
@@ -994,7 +1061,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       res.end();
     } else {
       const content = [];
-      if (thinking) content.push({ type: 'thinking', thinking });
       if (textContent) content.push({ type: 'text', text: textContent });
       if (toolBlock) content.push(toolBlock);
 
