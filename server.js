@@ -410,7 +410,7 @@ ${historyLogsText}
 }
 
 // ==========================================
-// 6. 核心重构：多模态容错提取与格式生成引擎
+// 6. 核心重构：多模态容错提取与原生工具协议装配
 // ==========================================
 function safeParseJson(str) {
   if (!str) return null;
@@ -419,7 +419,7 @@ function safeParseJson(str) {
     return JSON.parse(clean);
   } catch (e) {
     try {
-      // 容错修复：将长文本属性值内未转义的真换行符自动转义为 \n
+      // 容错修复：将长文本（如 content）内未转义的真换行符自动转为 \n，防止 JSON.parse 崩溃
       const fixed = clean.replace(/:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_, p1) => {
         return ': "' + p1.replace(/\r?\n/g, '\\n') + '"';
       });
@@ -434,6 +434,39 @@ function cleanLooseJson(str) {
   return str.replace(/,\s*([}\]])/g, '$1').replace(/\r\n/g, '\n').trim();
 }
 
+function scanBalancedJsonObject(text) {
+  let depth = 0;
+  let inStr = false;
+  let quoteChar = '';
+  let escape = false;
+  let start = -1;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === quoteChar) inStr = false;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inStr = true;
+      quoteChar = ch;
+    } else if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        const slice = text.slice(start, i + 1);
+        const obj = safeParseJson(slice);
+        if (obj) return obj;
+        start = -1;
+      }
+    }
+  }
+  return null;
+}
+
 function extractActionAndThought(rawText) {
   if (!rawText || typeof rawText !== 'string') return null;
   let thought = '';
@@ -441,7 +474,7 @@ function extractActionAndThought(rawText) {
   let params = {};
 
   // 1. 提取【思考】内容
-  const thoughtMatch = rawText.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|```json|```|$)/i);
+  const thoughtMatch = rawText.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|```json|```|<tool_call>|$)/i);
   if (thoughtMatch) {
     thought = thoughtMatch[1].trim();
   }
@@ -452,7 +485,7 @@ function extractActionAndThought(rawText) {
     action = actionMatch[1].trim();
   }
 
-  // 3. 提取 ```json 代码块里的参数
+  // 3. 提取代码块中的 JSON 参数
   const mdMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   let parsedJson = null;
   if (mdMatch) {
@@ -496,67 +529,6 @@ function extractActionAndThought(rawText) {
     thought: thought || '执行当前流水线步骤...',
     action: action || 'finish',
     params: params || {}
-  };
-}
-
-function scanBalancedJsonObject(text) {
-  let depth = 0;
-  let inStr = false;
-  let quoteChar = '';
-  let escape = false;
-  let start = -1;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      if (escape) escape = false;
-      else if (ch === '\\') escape = true;
-      else if (ch === quoteChar) inStr = false;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      inStr = true;
-      quoteChar = ch;
-    } else if (ch === '{') {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0 && start !== -1) {
-        const slice = text.slice(start, i + 1);
-        const obj = safeParseJson(slice);
-        if (obj) return obj;
-        start = -1;
-      }
-    }
-  }
-  return null;
-}
-
-// 核心转译：将思考与动作拼装为 Claude Code 标准工具调用格式
-function buildClaudeCodeResponse(parsedAction, rawAssistantText) {
-  if (!parsedAction || !parsedAction.action || parsedAction.action === 'finish') {
-    const summary = parsedAction?.params?.summary || parsedAction?.thought || rawAssistantText;
-    return {
-      thought: summary,
-      toolCall: null,
-      fullText: summary
-    };
-  }
-
-  const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
-  const toolCallPayload = {
-    name: mappedTool.name,
-    arguments: mappedTool.arguments
-  };
-
-  // 严格遵循规范：不要将 <tool_call> 放进 Markdown 代码块
-  const toolCallBlock = `<tool_call>\n${JSON.stringify(toolCallPayload)}\n</tool_call>`;
-  const thoughtText = parsedAction.thought || `调度 ${mappedTool.name}...`;
-
-  return {
-    thought: thoughtText,
-    toolCall: toolCallPayload,
-    fullText: `${thoughtText}\n\n${toolCallBlock}`
   };
 }
 
@@ -816,32 +788,78 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       blockIndex++;
     }
 
-    // 格式编译与转译
+    // 解析动作
     const parsedAction = extractActionAndThought(assistantText);
-    const { thought, toolCall, fullText } = buildClaudeCodeResponse(parsedAction, assistantText);
+    let stopReason = 'end_turn';
+    let textContent = '';
+    let toolBlock = null;
 
-    logger.debug('编译完成，准备下发给 Claude Code', {
-      '耗时': `${Date.now() - startTime}ms`,
-      '正文思考': thought,
-      '工具调用': toolCall ? toolCall.name : '无（流程终结）'
-    });
+    if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
+      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+      stopReason = 'tool_use';
+      textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
+      toolBlock = {
+        type: 'tool_use',
+        id: 'toolu_' + crypto.randomBytes(10).toString('hex'),
+        name: mappedTool.name,
+        input: mappedTool.arguments
+      };
+      logger.debug('成功装配 CC 原生工具调用', {
+        '耗时': `${Date.now() - startTime}ms`,
+        '思考内容': textContent,
+        '下发原生工具': mappedTool.name,
+        '工具参数': mappedTool.arguments
+      });
+    } else {
+      textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
+      stopReason = 'end_turn';
+    }
 
     if (stream) {
-      sendSSE('content_block_start', {
-        type: 'content_block_start',
-        index: blockIndex,
-        content_block: { type: 'text', text: '' }
-      });
-      sendSSE('content_block_delta', {
-        type: 'content_block_delta',
-        index: blockIndex,
-        delta: { type: 'text_delta', text: fullText }
-      });
-      sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+      // 1. 发送【思考】文本块 (index: 0 或 1)
+      if (textContent) {
+        sendSSE('content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: { type: 'text', text: '' }
+        });
+        sendSSE('content_block_delta', {
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: { type: 'text_delta', text: textContent }
+        });
+        sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+        blockIndex++;
+      }
 
+      // 2. 发送【工具调用】原生结构块 (严格符合 Anthropic Messages 协议)
+      if (toolBlock) {
+        sendSSE('content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: {
+            type: 'tool_use',
+            id: toolBlock.id,
+            name: toolBlock.name,
+            input: {}
+          }
+        });
+        sendSSE('content_block_delta', {
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify(toolBlock.input)
+          }
+        });
+        sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+        blockIndex++;
+      }
+
+      // 3. 发送带 tool_use 状态的 message_delta (通知终端立即拦截执行工具)
       sendSSE('message_delta', {
         type: 'message_delta',
-        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        delta: { stop_reason: stopReason, stop_sequence: null },
         usage: { output_tokens: 300 }
       });
       sendSSE('message_stop', { type: 'message_stop' });
@@ -849,7 +867,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     } else {
       const content = [];
       if (thinking) content.push({ type: 'thinking', thinking });
-      content.push({ type: 'text', text: fullText });
+      if (textContent) content.push({ type: 'text', text: textContent });
+      if (toolBlock) content.push(toolBlock);
 
       res.json({
         id: msgId,
@@ -857,7 +876,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         role: 'assistant',
         model,
         content,
-        stop_reason: 'end_turn',
+        stop_reason: stopReason,
         stop_sequence: null,
         usage: { input_tokens: 150, output_tokens: 300 }
       });
@@ -879,7 +898,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
   const { model, messages, stream } = req.body;
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
-  logger.debug('收到 OpenWebUI/ChatCompletions 请求', {
+  logger.debug('收到 OpenAI/ChatCompletions 调度请求', {
     目标上游: upstreamBase,
     本次增量输入: latestTurnInput || '（初始启动任务）'
   });
@@ -907,12 +926,50 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
-    // 解析并转译为 Claude Code 标准工具格式
     const parsedAction = extractActionAndThought(assistantText);
-    const { fullText } = buildClaudeCodeResponse(parsedAction, assistantText);
+    const callId = 'call_' + crypto.randomBytes(8).toString('hex');
+    let toolCalls = null;
+    let finishReason = 'stop';
+    let textContent = '';
+
+    if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
+      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+      finishReason = 'tool_calls';
+      textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
+      toolCalls = [{
+        index: 0,
+        id: callId,
+        type: 'function',
+        function: {
+          name: mappedTool.name,
+          arguments: JSON.stringify(mappedTool.arguments)
+        }
+      }];
+    } else {
+      textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
+      finishReason = 'stop';
+    }
 
     if (stream) {
-      res.write(`data: ${JSON.stringify({ id: 'chatcmpl-1', choices: [{ delta: { content: fullText, reasoning_content: thinking } }] })}\n\n`);
+      // 1. 发送思考正文
+      if (textContent) {
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-1',
+          choices: [{ delta: { content: textContent, reasoning_content: thinking }, index: 0 }]
+        })}\n\n`);
+      }
+      // 2. 发送标准工具调用块
+      if (toolCalls) {
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-1',
+          choices: [{ delta: { tool_calls: toolCalls }, index: 0 }]
+        })}\n\n`);
+      }
+      // 3. 结束流并指示 finish_reason 为 tool_calls
+      res.write(`data: ${JSON.stringify({
+        id: 'chatcmpl-1',
+        choices: [{ delta: {}, finish_reason: finishReason, index: 0 }]
+      })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
@@ -921,12 +978,20 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: [{ message: { role: 'assistant', content: fullText, reasoning_content: thinking }, finish_reason: 'stop' }]
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: textContent,
+            reasoning_content: thinking,
+            ...(toolCalls ? { tool_calls: toolCalls } : {})
+          },
+          finish_reason: finishReason
+        }]
       });
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('OpenWebUI 消息通道异常', err.message);
+    logger.error('ChatCompletions 消息通道异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
