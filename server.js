@@ -12,12 +12,8 @@ app.use(express.json({ limit: '100mb' }));
 const PORT = process.env.PORT || 7860;
 const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 
-// ==========================================
-// 1. 结构化日志模块 (带时间、流程、输入增量)
-// ==========================================
 function getTimestamp() {
-  const d = new Date();
-  return d.toISOString().replace('T', ' ').substring(0, 19);
+  return new Date().toISOString().replace('T', ' ').substring(0, 19);
 }
 
 const logger = {
@@ -37,14 +33,13 @@ const logger = {
 };
 
 // ==========================================
-// 2. 动态 URL 穿透解析器 (提取动态上游与端点)
+// 1. 动态 URL 穿透与前缀提取
 // ==========================================
 function parseDynamicUpstream(req) {
-  // 兼容 express 路径合并，从 originalUrl 中提取真实的 target URL
   let rawPath = req.originalUrl || req.url;
   const [cleanPath, query] = rawPath.split('?');
   
-  // 规范化去掉前置斜杠，修复 https:/ -> https://
+  // 还原被折叠的 http:/ 或 https:/ 为 http:// 或 https://
   let normalized = cleanPath.replace(/^\/+/, '').replace(/(https?):\/+(?!\/)/g, '$1://');
   
   const v1Index = normalized.lastIndexOf('/v1/');
@@ -54,7 +49,6 @@ function parseDynamicUpstream(req) {
     return { upstreamBase, endpoint };
   }
   
-  // 兜底方案
   return {
     upstreamBase: (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, ''),
     endpoint: cleanPath + (query ? `?${query}` : '')
@@ -62,7 +56,7 @@ function parseDynamicUpstream(req) {
 }
 
 // ==========================================
-// 3. 工具映射字典 (脱敏 Pipeline <-> CC原生)
+// 2. 工具双向映射
 // ==========================================
 const ACTION_TO_CC_TOOL = {
   fs_write: 'Write',
@@ -97,14 +91,12 @@ const CC_TOOL_TO_ACTION = {
 };
 
 // ==========================================
-// 4. 智能上下文压缩器 (精细化语义压缩)
+// 3. 上下文压缩器 (保留最近10轮，去重文件读取与日志)
 // ==========================================
 function compressHistorySteps(rawSteps) {
-  // 仅保留最近 10 轮
   const trimmed = rawSteps.slice(-10);
   if (trimmed.length === 0) return '（当前为初始化阶段，尚无执行历史）';
 
-  // 1. 扫描所有 Read 操作，找出每个文件最后一次读取的 index
   const lastReadIndexMap = new Map();
   trimmed.forEach((step, idx) => {
     if (step.action === 'fs_read' && step.params?.file_path) {
@@ -112,19 +104,16 @@ function compressHistorySteps(rawSteps) {
     }
   });
 
-  // 2. 逐步应用压缩策略
   const formattedLogs = trimmed.map((step, idx) => {
     const stepNum = idx + 1;
     let feedback = step.feedback || '[SUCCESS] 执行完成';
     let displayParams = { ...step.params };
 
-    // --- 策略 A: fs_write (源码脱敏，防止几十KB代码反复传递) ---
     if (step.action === 'fs_write') {
       const len = step.params.content ? step.params.content.length : 0;
-      displayParams.content = `[源码已成功写入磁盘，长度: ${len} 字符]`;
+      displayParams.content = `[源码已写入本地，长度: ${len} 字符]`;
     }
 
-    // --- 策略 B: fs_replace (长 diff 截断) ---
     if (step.action === 'fs_replace') {
       if (displayParams.old_string && displayParams.old_string.length > 80) {
         displayParams.old_string = displayParams.old_string.slice(0, 40) + '...[略]...' + displayParams.old_string.slice(-30);
@@ -134,36 +123,23 @@ function compressHistorySteps(rawSteps) {
       }
     }
 
-    // --- 策略 C: fs_read (多重读取去重压缩) ---
     if (step.action === 'fs_read') {
       const filePath = step.params.file_path;
       const lastIdx = lastReadIndexMap.get(filePath);
       if (lastIdx !== undefined && lastIdx !== idx) {
-        // 不是最新一次读取，高度压缩
-        feedback = `[早期版本文件内容已读取，该文件在后续第 ${lastIdx + 1} 步有最新读取，早期内容在此折叠]`;
-      } else {
-        // 是最新一次读取，保留足够上下文，超长部分保护性截取
-        if (feedback.length > 3000) {
-          feedback = feedback.slice(0, 1800) + '\n...[中间部分省略]...\n' + feedback.slice(-1000);
-        }
+        feedback = `[早期版本已读取，第 ${lastIdx + 1} 步有最新内容，此处折叠]`;
+      } else if (feedback.length > 3000) {
+        feedback = feedback.slice(0, 1800) + '\n...[中间省略]...\n' + feedback.slice(-1000);
       }
     }
 
-    // --- 策略 D: shell_exec (输出去重与错误保真) ---
     if (step.action === 'shell_exec') {
       const isError = /error|failed|exit code [1-9]|command not found/i.test(feedback);
       if (!isError && feedback.length > 800) {
-        // 成功日志精简 (保留头部与尾部摘要)
-        feedback = feedback.slice(0, 300) + `\n...[执行通过，流水日志省略 ${feedback.length - 600} 字符]...\n` + feedback.slice(-300);
+        feedback = feedback.slice(0, 300) + `\n...[输出省略 ${feedback.length - 600} 字符]...\n` + feedback.slice(-300);
       } else if (isError && feedback.length > 2500) {
-        // 报错保留最核心的 traceback 尾部
         feedback = feedback.slice(-2500);
       }
-    }
-
-    // --- 策略 E: net_search / net_fetch 压缩 ---
-    if ((step.action === 'net_search' || step.action === 'net_fetch') && feedback.length > 1000) {
-      feedback = feedback.slice(0, 800) + `\n...[网络抓取结果超长折叠，共 ${feedback.length} 字符]...`;
     }
 
     return `--- Step ${stepNum} ---
@@ -176,15 +152,11 @@ ${feedback}`;
   return formattedLogs.join('\n\n');
 }
 
-// ==========================================
-// 5. 消息解析与增量提取 (用于输入审计)
-// ==========================================
 function parseMessages(messages = []) {
   let globalTask = '';
   const rawSteps = [];
-  let latestTurnInput = null; // 仅限本次增量输入
+  let latestTurnInput = null;
 
-  // 1. 寻找最初的全局任务
   for (const msg of messages) {
     if (msg.role === 'user') {
       const content = Array.isArray(msg.content)
@@ -198,7 +170,6 @@ function parseMessages(messages = []) {
   }
   if (!globalTask) globalTask = '处理当前工作目录下的任务。';
 
-  // 2. 提取当前增量输入 (用于调试日志打印)
   const lastMsg = messages[messages.length - 1];
   if (lastMsg) {
     if (typeof lastMsg.content === 'string') {
@@ -208,8 +179,7 @@ function parseMessages(messages = []) {
       if (toolResults.length > 0) {
         latestTurnInput = toolResults.map(tr => {
           let text = typeof tr.content === 'string' ? tr.content : (tr.content?.map(c => c.text).join('') || '');
-          if (text.length > 200) text = text.slice(0, 200) + '...[截断]';
-          return `[工具回执 ID:${tr.tool_use_id}]: ${text}`;
+          return `[工具回执 ID:${tr.tool_use_id}]: ${text.slice(0, 200)}`;
         }).join(' | ');
       } else {
         const textItem = lastMsg.content.find(c => c.type === 'text');
@@ -218,7 +188,6 @@ function parseMessages(messages = []) {
     }
   }
 
-  // 3. 抽取完整的 step 序列
   let activeStep = null;
   for (const msg of messages) {
     const contents = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content }];
@@ -236,10 +205,7 @@ function parseMessages(messages = []) {
       for (const item of contents) {
         if (item.type === 'tool_result' && activeStep) {
           let out = typeof item.content === 'string' ? item.content : (item.content?.map(c => c.text).join('\n') || '');
-          rawSteps.push({
-            ...activeStep,
-            feedback: out
-          });
+          rawSteps.push({ ...activeStep, feedback: out });
           activeStep = null;
         }
       }
@@ -249,9 +215,6 @@ function parseMessages(messages = []) {
   return { globalTask, historyLogsText: compressHistorySteps(rawSteps), latestTurnInput };
 }
 
-// ==========================================
-// 6. 构造抗风控 Pipeline 提示词
-// ==========================================
 function buildPrompt(globalTask, historyLogsText) {
   return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块（JSON 格式），由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
 
@@ -315,14 +278,65 @@ function extractActionJson(rawText) {
     if (match && match[1]) return JSON.parse(match[1]);
     const looseMatch = rawText.match(/\{[\s\S]*"action"[\s\S]*\}/);
     if (looseMatch) return JSON.parse(looseMatch[0]);
-  } catch (e) {
-    // 忽略异常，降级处理
-  }
+  } catch (e) {}
   return null;
 }
 
 // ==========================================
-// 7. 接口: GET */v1/models (动态获取上游模型)
+// 4. 向上游请求核心调度器 (带自动回退与防卡死)
+// ==========================================
+async function callUpstream(upstreamBase, apiKey, model, prompt) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    'Authorization': `Bearer ${apiKey}`,
+    'x-api-key': apiKey,
+    'anthropic-version': '2023-06-01'
+  };
+
+  // 1. 先尝试 Anthropic /v1/messages 接口
+  try {
+    const res = await fetch(`${upstreamBase}/v1/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: model || 'claude-3-7-sonnet-20250219',
+        max_tokens: 4096,
+        messages: [{ role: 'user', content: prompt }]
+      }),
+      signal: AbortSignal.timeout(45000)
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      return data.content?.[0]?.text || '';
+    }
+  } catch (e) {
+    logger.debug('原生 messages 接口尝试未果，切入 chat/completions 兼容模式', e.message);
+  }
+
+  // 2. 回退尝试 OpenAI /v1/chat/completions 接口
+  const chatRes = await fetch(`${upstreamBase}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: model || 'claude-3-7-sonnet-20250219',
+      messages: [{ role: 'user', content: prompt }]
+    }),
+    signal: AbortSignal.timeout(45000)
+  });
+
+  if (!chatRes.ok) {
+    const errText = await chatRes.text();
+    throw new Error(`上游调用双向失败: ${chatRes.status} ${errText}`);
+  }
+
+  const chatData = await chatRes.json();
+  return chatData.choices?.[0]?.message?.content || '';
+}
+
+// ==========================================
+// 5. 路由 1: GET */v1/models (模型列表透传)
 // ==========================================
 app.get(/(.*)\/v1\/models$/, async (req, res) => {
   const { upstreamBase } = parseDynamicUpstream(req);
@@ -330,15 +344,14 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
 
   try {
     const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
-    const targetUrl = `${upstreamBase}/v1/models`;
-
-    const upstreamRes = await fetch(targetUrl, {
+    const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
       method: 'GET',
       headers: {
         'Authorization': authHeader,
         'x-api-key': req.headers['x-api-key'] || '',
-        'Content-Type': 'application/json'
-      }
+        'User-Agent': 'Mozilla/5.0'
+      },
+      signal: AbortSignal.timeout(10000)
     });
 
     if (upstreamRes.ok) {
@@ -346,21 +359,71 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
       return res.json(data);
     }
   } catch (err) {
-    logger.error('上游模型拉取失败，启用自适应兜底列表', err.message);
+    logger.error('上游模型列表获取失败，启用默认列表', err.message);
   }
 
-  // 兜底列表，确保 Claude Code 连接时绝不崩溃
   res.json({
     object: 'list',
     data: [
-      { id: 'claude-3-7-sonnet-20250219', object: 'model', created: Date.now(), owned_by: 'anthropic' },
-      { id: 'claude-3-5-sonnet-20241022', object: 'model', created: Date.now(), owned_by: 'anthropic' }
+      { id: 'claude-3-7-sonnet-20250219', object: 'model' },
+      { id: 'claude-3-5-sonnet-20241022', object: 'model' }
     ]
   });
 });
 
 // ==========================================
-// 8. 接口: POST */v1/messages (核心调度与流式回传)
+// 6. 路由 2: POST */v1/chat/completions (OpenWebUI 适配通道)
+// ==========================================
+app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
+  const startTime = Date.now();
+  const { upstreamBase } = parseDynamicUpstream(req);
+  const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
+  const { model, messages, stream } = req.body;
+
+  const { globalTask, historyLogsText, latestTurnInput } = parseMessages(messages || []);
+  logger.debug('收到 OpenWebUI 请求', {
+    目标上游: upstreamBase,
+    模型: model,
+    本次增量输入: latestTurnInput || '（初始启动任务）'
+  });
+
+  try {
+    const prompt = buildPrompt(globalTask, historyLogsText);
+    const assistantText = await callUpstream(upstreamBase, apiKey, model, prompt);
+    const actionObj = extractActionJson(assistantText);
+
+    let finalOutput = assistantText;
+    if (actionObj && actionObj.action) {
+      finalOutput = `【思考】: ${actionObj.step_thought || ''}\n【调度动作】: ${actionObj.action}\n\`\`\`json\n${JSON.stringify(actionObj.params, null, 2)}\n\`\`\``;
+    }
+
+    logger.debug('OpenWebUI 响应完成', { 耗时: `${Date.now() - startTime}ms` });
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      res.write(`data: ${JSON.stringify({ id: 'chatcmpl-1', choices: [{ delta: { content: finalOutput } }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      res.json({
+        id: 'chatcmpl-' + crypto.randomBytes(8).toString('hex'),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ message: { role: 'assistant', content: finalOutput }, finish_reason: 'stop' }]
+      });
+    }
+  } catch (err) {
+    logger.error('OpenWebUI 链路异常', err.message);
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+// ==========================================
+// 7. 路由 3: POST */v1/messages (Claude Code 适配通道)
 // ==========================================
 app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const startTime = Date.now();
@@ -368,47 +431,18 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
   const { model, messages, stream } = req.body;
 
-  // 1. 提取本次增量输入和历史压缩上下文
   const { globalTask, historyLogsText, latestTurnInput } = parseMessages(messages || []);
-  
-  logger.debug('收到客户端请求', {
+  logger.debug('收到 Claude Code 请求', {
     目标上游: upstreamBase,
     模型: model,
     本次增量输入: latestTurnInput || '（初始启动任务）'
   });
 
-  const prompt = buildPrompt(globalTask, historyLogsText);
-
   try {
-    // 2. 向上游发起单轮请求 (模型从 body 动态获取)
-    const targetUrl = `${upstreamBase}/v1/messages`;
-    const upstreamRes = await fetch(targetUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'Authorization': `Bearer ${apiKey}`,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: model || 'claude-3-7-sonnet-20250219',
-        max_tokens: 4096,
-        messages: [{ role: 'user', content: prompt }],
-        stream: false
-      })
-    });
-
-    if (!upstreamRes.ok) {
-      const errText = await upstreamRes.text();
-      logger.error('上游接口调用失败', { status: upstreamRes.status, body: errText });
-      return res.status(upstreamRes.status).send(errText);
-    }
-
-    const upstreamData = await upstreamRes.json();
-    const assistantText = upstreamData.content?.[0]?.text || '';
+    const prompt = buildPrompt(globalTask, historyLogsText);
+    const assistantText = await callUpstream(upstreamBase, apiKey, model, prompt);
     const actionObj = extractActionJson(assistantText);
 
-    // 3. 构建 Claude Code 原生工具调用结构
     const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
     const toolCallId = 'call_' + crypto.randomBytes(8).toString('hex');
     let responseContent = [];
@@ -433,13 +467,12 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       responseContent = [{ type: 'text', text: summary }];
       stopReason = 'end_turn';
 
-      logger.debug('流程终结或纯文本回复', {
+      logger.debug('流程收尾总结', {
         耗时: `${Date.now() - startTime}ms`,
-        总结: summary.slice(0, 300) + (summary.length > 300 ? '...' : '')
+        总结: summary.slice(0, 200)
       });
     }
 
-    // 4. 流式 (SSE) / 非流式输出适配
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -485,16 +518,15 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         usage: { input_tokens: 150, output_tokens: 250 }
       });
     }
-
   } catch (err) {
-    logger.error('消息处理管线异常', err.message);
-    res.status(500).json({ error: { type: 'proxy_internal_error', message: err.message } });
+    logger.error('Claude Code 消息处理异常', err.message);
+    res.status(500).json({ error: { type: 'proxy_error', message: err.message } });
   }
 });
 
-// 启动监听
+// 启动
 app.listen(PORT, () => {
   console.log(`\n======================================================`);
-  console.log(` cc中介已启动 (监听端口: ${PORT})`);
+  console.log(` Claude Code 智能中介已启动 (端口: ${PORT})`);
   console.log(`======================================================\n`);
 });
