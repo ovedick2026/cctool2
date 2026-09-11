@@ -229,17 +229,17 @@ function formatLocalFeedback(str, actionName, isTodoFile = false) {
 
   if (actionName === 'fs_read') {
     if (text.length > 3000) {
-      return text.slice(0, 1800) + '\n...[中间内容省略]...\n' + text.slice(-1000);
+      return text;
     }
-  } else if (actionName === 'shell_exec') {
+  } else if (actionName === 'shell_exec' || actionName === 'Bash') {
     const hasErr = /error|fail|exit code [1-9]|command not found/i.test(text);
-    if (!hasErr && text.length > 1000) {
-      return text.slice(0, 300) + `\n...[输出流水折叠 ${text.length - 600} 字符]...\n` + text.slice(-300);
-    } else if (hasErr && text.length > 2500) {
-      return text.slice(-2500);
+    if (!hasErr && text.length > 1200) {
+      return text.slice(0, 400) + `\n...[输出流水折叠 ${text.length - 800} 字符]...\n` + text.slice(-400);
+    } else if (hasErr && text.length > 3500) {
+      return text.slice(-3500);
     }
-  } else if (text.length > 1500) {
-    return text.slice(0, 800) + '\n...[略]...\n' + text.slice(-500);
+  } else if (actionName !== 'fs_write' && text.length > 2000) {
+    return text.slice(0, 1000) + '\n...[略]...\n' + text.slice(-600);
   }
   return text;
 }
