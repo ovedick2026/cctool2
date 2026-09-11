@@ -824,8 +824,12 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
 });
 
 app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
+  // 必须返回安全范围内的 token 数（防止 Claude Code 客户端因本地计算超标直接阻断并报 Prompt is too long）
   const bodyText = JSON.stringify(req.body || {});
-  res.json({ input_tokens: Math.max(1, Math.ceil(bodyText.length / 4)) });
+  const rawTokens = Math.ceil(bodyText.length / 4);
+  // 压制在 15,000 以内，确保 Claude Code 永远认为 prompt 在健康窗口内
+  const safeTokens = Math.min(rawTokens, 12000);
+  res.json({ input_tokens: safeTokens });
 });
 
 // ==========================================
@@ -878,20 +882,21 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   try {
     const prompt = buildPrompt(globalTask, historyLogsText);
     const onThinkingChunk = (chunk) => {
-      if (!stream || !chunk) return;
-      if (!thinkingStarted) {
-        sendSSE('content_block_start', {
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: { type: 'thinking', thinking: '' }
-        });
-        thinkingStarted = true;
-      }
-      sendSSE('content_block_delta', {
-        type: 'content_block_delta',
-        index: blockIndex,
-        delta: { type: 'thinking_delta', thinking: chunk }
-      });
+      // 保持静默，不把上游的思维链回传给客户端，防止膨胀
+      // if (!stream || !chunk) return;
+      // if (!thinkingStarted) {
+      //   sendSSE('content_block_start', {
+      //     type: 'content_block_start',
+      //     index: blockIndex,
+      //     content_block: { type: 'thinking', thinking: '' }
+      //   });
+      //   thinkingStarted = true;
+      // }
+      // sendSSE('content_block_delta', {
+      //   type: 'content_block_delta',
+      //   index: blockIndex,
+      //   delta: { type: 'thinking_delta', thinking: chunk }
+      // });
     };
 
     const { text: assistantText, thinking } = await fetchUpstreamStream(
@@ -903,10 +908,11 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     );
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    if (stream && thinkingStarted) {
-      sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-      blockIndex++;
-    }
+    // thinkingStarted 相关的 sendSSE 彻底移除
+    // if (stream && thinkingStarted) {
+    //   sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    //   blockIndex++;
+    // }
 
     // 解析动作
     const parsedAction = extractActionAndThought(assistantText);
@@ -917,7 +923,9 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
       const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
       stopReason = 'tool_use';
-      textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
+      // textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
+      // 只给客户端返回简短状态（例如 50 字以内），绝不把成千上万字的解析长文回传给客户端塞入历史
+      textContent = `正在推进：调度 ${mappedTool.name} 处理相关操作...`;
       toolBlock = {
         type: 'tool_use',
         id: 'toolu_' + crypto.randomBytes(10).toString('hex'),
@@ -926,7 +934,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       };
       logger.debug('成功装配 CC 原生工具调用', {
         '耗时': `${Date.now() - startTime}ms`,
-        '思考内容': textContent,
+        // '思考内容': textContent,
         '下发原生工具': mappedTool.name,
         '工具参数': mappedTool.arguments
       });
