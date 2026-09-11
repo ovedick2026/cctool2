@@ -205,6 +205,8 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
   return text
+    .replace(/REMINDER:\s*You MUST include the sources[\s\S]*?hyperlinks\./gi, '')
+    .replace(/Wasted call\s*—\s*file unchanged[\s\S]*?instead\./gi, '[SUCCESS] 文件未修改，状态已是最新。')
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
     .replace(/<total_tokens>[\s\S]*?<\/total_tokens>/gi, '')
     .replace(/<task-notification>[\s\S]*?<\/task-notification>/gi, '')
@@ -246,7 +248,7 @@ function formatLocalFeedback(str, actionName, isTodoFile = false) {
 
 function compressHistorySteps(rawSteps) {
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
-  const trimmed = validSteps.slice(-10);
+  const trimmed = validSteps.slice(-6);
   if (trimmed.length === 0) {
     return '（当前为初始化阶段，尚无历史记录）';
   }
@@ -367,6 +369,11 @@ function parseConversation(messages = []) {
           const tMatch = clean.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
           turnThought = tMatch ? tMatch[1].trim() : clean.slice(0, 150);
         }
+      }
+
+      // ★ 核心纠偏：如果已有历史步骤（并非第1步），思考内容却还在复读“初始化”，强制纠正意图，防止模型逻辑死锁
+      if (rawSteps.length > 0 && /初始化阶段|尚无历史记录/i.test(turnThought)) {
+        turnThought = '推进当前阶段任务与文档构建';
       }
 
       // A. Anthropic 原生 tool_use 块
