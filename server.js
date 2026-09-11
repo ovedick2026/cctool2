@@ -200,7 +200,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 对话历史解析与智能压缩引擎（【202609111538修改】：彻底修复队列残留导致复读第一步的Bug）
+// 4. 对话历史解析与智能压缩引擎（【本次修改】：彻底斩断思考回声，纯净动作与反馈映射）
 // ==========================================
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
@@ -232,7 +232,7 @@ function formatLocalFeedback(str, actionName, isTodoFile = false) {
   if (actionName === 'fs_read') {
     return text;
   } else if (actionName === 'shell_exec' || actionName === 'Bash') {
-    const hasErr = /error|fail|exit code [1-9]|command not found/i.test(text);
+    const hasErr = /error|fail|exit code [1-9]|command not found|cannot access|No such file/i.test(text);
     if (!hasErr && text.length > 1200) {
       return text.slice(0, 400) + `\n...[输出流水折叠 ${text.length - 800} 字符]...\n` + text.slice(-400);
     } else if (hasErr && text.length > 3500) {
@@ -244,9 +244,10 @@ function formatLocalFeedback(str, actionName, isTodoFile = false) {
   return text;
 }
 
-/* 【202609111538修改点 1】：重构 compressHistorySteps。
-   1. 解决陈旧思考导致模型迷失：从【执行配置】中剥离易导致逻辑死锁的长文 step_thought。
-   2. 采用精准提炼的 step_action_summary，客观描述每一轮的具体意图（例：fs_read: todo.md / shell_exec: ls -la）。
+/* 【本次修改 1】：彻底重构 compressHistorySteps
+   - 彻底删除【执行配置】中的 step_thought / action_summary 字段！
+   - 参考 adapt.js 核心设计：历史只保留客观事实（Action + Params + Result），坚决不向历史注入思维链。
+   - 这从物理上根除了“每一轮都复读第一步初始化思考”的问题。
 */
 function compressHistorySteps(rawSteps) {
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
@@ -265,9 +266,10 @@ function compressHistorySteps(rawSteps) {
   return trimmed.map((step, idx) => {
     let feedback = step.feedback || '[SUCCESS] 执行完成';
     let params = { ...step.params };
-    const isTodoFile = params.file_path === 'todo.md' || params.path === 'todo.md' || String(params.file_path || '').endsWith('/todo.md');
+    const filePathStr = String(params.file_path || params.path || '');
+    const isTodoFile = filePathStr === 'todo.md' || filePathStr.endsWith('/todo.md');
 
-    // 1. fs_write 参数精简与 todo 保护
+    // 1. fs_write 参数处理
     if (step.action === 'fs_write') {
       if (isTodoFile) {
         params = {
@@ -276,14 +278,14 @@ function compressHistorySteps(rawSteps) {
         };
       } else {
         const len = step.params?.content ? String(step.params.content).length : 0;
-        params = { file_path: step.params?.file_path || 'file' };
+        params = { file_path: params.file_path || 'file' };
         if (len > 0) {
           params.content = `[源码/文档内容已写入，共 ${len} 字符]`;
         }
       }
     }
 
-    // 2. fs_replace 参数精简
+    // 2. fs_replace 参数处理
     if (step.action === 'fs_replace') {
       if (!isTodoFile) {
         if (params.old_string?.length > 80) {
@@ -295,7 +297,7 @@ function compressHistorySteps(rawSteps) {
       }
     }
 
-    // 3. fs_read 反馈处理（避免前序大文件重复占用上下文）
+    // 3. fs_read 反馈处理
     if (step.action === 'fs_read') {
       const p = step.params?.file_path;
       if (lastReadMap.get(p) !== idx) {
@@ -307,16 +309,10 @@ function compressHistorySteps(rawSteps) {
       feedback = formatLocalFeedback(feedback, step.action, isTodoFile);
     }
 
-    // 【202609111538修改点】：提取本步真实的意图摘要，不把陈旧思考放进 JSON
-    const targetDesc = params.file_path || params.path || (params.command ? params.command.slice(0, 60) : '') || '';
-    const stepSummary = step.step_thought && step.step_thought !== '执行当前流水线步骤...' 
-      ? step.step_thought 
-      : `调度 ${step.action} ${targetDesc ? '-> ' + targetDesc : ''}`.trim();
-
+    /* 【本次修改】：【执行配置】只输出纯净、合法的 action 与 params，杜绝一切模型历史文本注入 */
     return `--- Step ${idx + 1} ---
 【执行配置】：
 ${JSON.stringify({
-  action_summary: stepSummary,
   action: step.action,
   params: params
 }, null, 2)}
@@ -325,8 +321,9 @@ ${feedback}`;
   }).join('\n\n');
 }
 
-/* 【202609111538修改点 2】：深度重构 parseConversation 状态机。
-   彻底修复队列同步 Bug（原代码 pendingSteps 与 sequentialPending 脱节导致第 1 步对象死锁残留的问题）。
+/* 【本次修改 2】：重构 parseConversation
+   - 参考 adapt.js 对 Claude Code 协议的处理方式，基于 tool_use_id 构建单向严格对应映射。
+   - 不再尝试跨轮保留或拼接任何自然语言 thought，从输入源头切断“第一步文本溢出到后续轮次”。
 */
 function parseConversation(messages = []) {
   let globalTask = '';
@@ -340,7 +337,7 @@ function parseConversation(messages = []) {
     ReportFindings: 'code_audit'
   };
 
-  // 1. 提取全局初始目标
+  // 1. 提取全局初始目标（取首条真实用户指令）
   for (const msg of messages) {
     if (msg.role === 'user') {
       let rawText = '';
@@ -357,57 +354,32 @@ function parseConversation(messages = []) {
   }
   if (!globalTask) globalTask = '推进当前目录的todo.md并完成项目构建。';
 
-  // 2. 双向解析与严格有序闭环队列
-  // 【202609111538修改点】：使用统一的 pendingStepsList 数组，杜绝 Map 与 Array 状态脱节
-  let pendingStepsList = [];
+  // 2. 状态机：成对解析 Claude Code 的 tool_use 和 tool_result
+  const pendingSteps = new Map();
+  const sequentialQueue = [];
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
 
     // ======== 解析 Assistant 调度动作 ========
     if (msg.role === 'assistant') {
-      let turnThought = '';
-
-      // 【202609111538修改点】：适配 Claude Code 真实传回格式，不依赖死板的“【思考】：”正则
-      if (typeof msg.content === 'string') {
-        const clean = cleanNoise(msg.content);
-        const tMatch = clean.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
-        if (tMatch) {
-          turnThought = tMatch[1].trim();
-        } else if (!clean.startsWith('{') && !clean.startsWith('<')) {
-          // 如果是普通的自然语言思考，取首段核心摘要（80字以内），避免冗长
-          turnThought = clean.split('\n')[0].slice(0, 80).trim();
-        }
-      } else if (Array.isArray(msg.content)) {
-        // 合并所有类型为 text 的块作为思考
-        const textParts = msg.content
-          .filter(c => c.type === 'text' && c.text)
-          .map(c => cleanNoise(c.text))
-          .filter(t => t && !t.startsWith('{') && !t.startsWith('<'));
-        
-        if (textParts.length > 0) {
-          const combined = textParts.join(' ');
-          const tMatch = combined.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|<tool_call>|```|$)/i);
-          turnThought = tMatch ? tMatch[1].trim() : combined.split('\n')[0].slice(0, 80).trim();
-        }
-      }
-
-      // A. Anthropic 原生 tool_use 块
+      // A. Anthropic 原生 tool_use 数组（Claude Code 核心通道）
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_use') {
             const mappedAction = CC_TO_ACTION_MAP[p.name] || 'shell_exec';
-            pendingStepsList.push({
+            const stepObj = {
               id: p.id || '',
-              step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
               action: mappedAction,
               params: p.input || {}
-            });
+            };
+            if (p.id) pendingSteps.set(p.id, stepObj);
+            sequentialQueue.push(stepObj);
           }
         }
       }
 
-      // B. OpenAI tool_calls 兼容
+      // B. OpenAI 兼容 tool_calls
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
           const fnName = tc.function?.name || '';
@@ -418,16 +390,17 @@ function parseConversation(messages = []) {
           } catch {
             params = {};
           }
-          pendingStepsList.push({
+          const stepObj = {
             id: tc.id || '',
-            step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
             action: mappedAction,
             params
-          });
+          };
+          if (tc.id) pendingSteps.set(tc.id, stepObj);
+          sequentialQueue.push(stepObj);
         }
       }
 
-      // C. 文本标签兼容
+      // C. 文本标签容错
       if (typeof msg.content === 'string' && msg.content.includes('<tool_call>')) {
         const tcMatch = msg.content.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i);
         if (tcMatch) {
@@ -435,12 +408,12 @@ function parseConversation(messages = []) {
             const parsed = JSON.parse(cleanLooseJson(tcMatch[1]));
             if (parsed.name) {
               const mappedAction = CC_TO_ACTION_MAP[parsed.name] || 'shell_exec';
-              pendingStepsList.push({
+              const stepObj = {
                 id: '',
-                step_thought: turnThought || `调度 ${mappedAction} 执行操作`,
                 action: mappedAction,
                 params: parsed.arguments || {}
-              });
+              };
+              sequentialQueue.push(stepObj);
             }
           } catch {}
         }
@@ -449,25 +422,24 @@ function parseConversation(messages = []) {
 
     // ======== 解析 User / Tool 执行反馈并闭环 ========
     else if (msg.role === 'user' || msg.role === 'tool') {
-      // 内部辅助消费函数：【202609111538修改点】：通过单一入口消费，确保出队严格同步，彻底消灭残留复读
-      const consumeMatchedStep = (matchId) => {
-        if (pendingStepsList.length === 0) return null;
-        if (matchId) {
-          const foundIdx = pendingStepsList.findIndex(s => s.id === matchId);
-          if (foundIdx !== -1) {
-            const [item] = pendingStepsList.splice(foundIdx, 1);
-            return item;
-          }
+      // 消费匹配函数：严格保持单步出队，消除内存错位
+      const matchAndPopStep = (toolCallId) => {
+        if (toolCallId && pendingSteps.has(toolCallId)) {
+          const step = pendingSteps.get(toolCallId);
+          pendingSteps.delete(toolCallId);
+          // 同时从排队序列中移除，保持状态一致
+          const qIdx = sequentialQueue.findIndex(s => s.id === toolCallId);
+          if (qIdx !== -1) sequentialQueue.splice(qIdx, 1);
+          return step;
         }
-        // 若没有 ID 或按 ID 未查到，按顺序弹出队列头部
-        return pendingStepsList.shift();
+        return sequentialQueue.shift() || null;
       };
 
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_result') {
             const outText = typeof p.content === 'string' ? p.content : (p.content?.map(c => c.text).join('\n') || '');
-            const matchedStep = consumeMatchedStep(p.tool_use_id);
+            const matchedStep = matchAndPopStep(p.tool_use_id);
             if (matchedStep) {
               rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
             }
@@ -475,14 +447,14 @@ function parseConversation(messages = []) {
         }
       } else if (msg.role === 'tool' && msg.tool_call_id) {
         const outText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        const matchedStep = consumeMatchedStep(msg.tool_call_id);
+        const matchedStep = matchAndPopStep(msg.tool_call_id);
         if (matchedStep) {
           rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
         }
       } else if (typeof msg.content === 'string') {
         const text = cleanNoise(msg.content);
-        if (text && !text.startsWith("Today's date is") && pendingStepsList.length > 0) {
-          const matchedStep = consumeMatchedStep(null);
+        if (text && !text.startsWith("Today's date is") && sequentialQueue.length > 0) {
+          const matchedStep = matchAndPopStep(null);
           if (matchedStep) {
             rawSteps.push({ ...matchedStep, feedback: text });
           }
