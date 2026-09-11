@@ -353,7 +353,7 @@ function parseConversation(messages = []) {
 }
 
 // ==========================================
-// 5. 强化版抗风控 Prompt (带明确规范模板)
+// 5. 强化版抗风控 Prompt (严格模板约束)
 // ==========================================
 function buildPrompt(globalTask, historyLogsText) {
   return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
@@ -380,91 +380,100 @@ function buildPrompt(globalTask, historyLogsText) {
 
 【流水线设计约束】：
 1. 拆解规范：当工作流初次启动（无历史记录）时，第一个步骤必须对任务进行极细致的拆解（具体到单文件、单页面或单步骤），输出一个 action 为 "fs_write" 的配置，将任务项全为 [ ] 的 todo.md 写入本地。
-2. 单步原则：为保证系统可控性，每个回复只能输出当前唯一步骤的配置，不可合并多个步骤。
-3. 状态闭环：当外部反馈某个步骤已完成，后续应当安排配置将 todo.md 中对应项目更新为 [x]。
-4. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
+2. 单步原则：每个回复只能输出当前唯一步骤的配置，不可合并多个步骤。
+3. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
+4. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n，不要打回车换行）。
 
-【强制返回格式模板】（请严格按此结构输出，不要更改标记）：
-【思考】: 详细分析当前状态与该步骤目的
-【调度动作】: 指令名称（如 fs_write / shell_exec 等，或 finish）
+【强制返回格式模板示例】:
+【思考】: 说明当前步骤的意图与判断分析...
+【调度动作】: fs_write
 \`\`\`json
 {
-  ...对应指令所需的参数键值对...
+  "file_path": "todo.md",
+  "content": "# 任务清单\\n- [ ] 步骤一\\n- [ ] 步骤二"
 }
 \`\`\`
 
 =======================================================
 【全局目标任务】：
 ${globalTask}
-
 =======================================================
 【历史执行记录】：
 ${historyLogsText}
-
 =======================================================
 【当前调度决策】：
 请综合【全局目标任务】与【历史执行记录】，评估当前阶段并输出下一步操作：
 - 若尚未初始化，输出生成详尽 todo.md 的单一配置。
 - 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
 - 若所有项已全部完成，输出 finish 配置。
-
 请输出当前步骤的配置：`;
 }
 
 // ==========================================
-// 6. 核心重构：多模态容错提取引擎
+// 6. 核心重构：多模态容错提取与格式生成引擎
 // ==========================================
+function safeParseJson(str) {
+  if (!str) return null;
+  const clean = cleanLooseJson(str);
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    try {
+      // 容错修复：将长文本属性值内未转义的真换行符自动转义为 \n
+      const fixed = clean.replace(/:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_, p1) => {
+        return ': "' + p1.replace(/\r?\n/g, '\\n') + '"';
+      });
+      return JSON.parse(fixed);
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+
+function cleanLooseJson(str) {
+  return str.replace(/,\s*([}\]])/g, '$1').replace(/\r\n/g, '\n').trim();
+}
+
 function extractActionAndThought(rawText) {
   if (!rawText || typeof rawText !== 'string') return null;
-
   let thought = '';
   let action = '';
   let params = {};
 
-  // 1. 尝试提取形如 【思考】: ... 【调度动作】: ... ```json {...} ``` 的格式
-  const thoughtMatch = rawText.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|```|$)/i);
+  // 1. 提取【思考】内容
+  const thoughtMatch = rawText.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|```json|```|$)/i);
   if (thoughtMatch) {
     thought = thoughtMatch[1].trim();
   }
 
+  // 2. 提取【调度动作】指令名称
   const actionMatch = rawText.match(/【调度动作】[：:]\s*([a-zA-Z0-9_]+)/i);
   if (actionMatch) {
     action = actionMatch[1].trim();
   }
 
-  // 提取 ```json 代码块里的 JSON 对象
+  // 3. 提取 ```json 代码块里的参数
   const mdMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   let parsedJson = null;
   if (mdMatch) {
-    try {
-      parsedJson = JSON.parse(cleanLooseJson(mdMatch[1]));
-    } catch {}
+    parsedJson = safeParseJson(mdMatch[1]);
   }
-
-  // 如果没有 markdown 代码块，用括号平衡扫描整个文本中的 JSON
   if (!parsedJson) {
     parsedJson = scanBalancedJsonObject(rawText);
   }
 
-  // 综合判定
   if (parsedJson && typeof parsedJson === 'object') {
-    // 模式 A：标准的单一大 JSON { step_thought, action, params }
     if (parsedJson.action) {
       action = parsedJson.action;
       thought = parsedJson.step_thought || parsedJson.thought || thought;
       params = parsedJson.params || parsedJson.arguments || parsedJson;
-      // 去除 params 中多余的外层包装
       if (params.action) {
         const { action: _a, step_thought: _st, thought: _t, ...rest } = params;
         params = rest;
       }
-    }
-    // 模式 B：文本已标明【调度动作】，代码块里放的是纯 params
-    else if (action) {
+    } else if (action) {
       params = parsedJson;
-    }
-    // 模式 C：JSON 里包含典型指令特征推断
-    else if (parsedJson.file_path && parsedJson.content !== undefined) {
+    } else if (parsedJson.file_path && parsedJson.content !== undefined) {
       action = 'fs_write';
       params = parsedJson;
     } else if (parsedJson.command) {
@@ -490,17 +499,12 @@ function extractActionAndThought(rawText) {
   };
 }
 
-function cleanLooseJson(str) {
-  return str.replace(/,\s*([}\]])/g, '$1').replace(/\r\n/g, '\n').trim();
-}
-
 function scanBalancedJsonObject(text) {
   let depth = 0;
   let inStr = false;
   let quoteChar = '';
   let escape = false;
   let start = -1;
-
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (inStr) {
@@ -519,14 +523,41 @@ function scanBalancedJsonObject(text) {
       depth--;
       if (depth === 0 && start !== -1) {
         const slice = text.slice(start, i + 1);
-        try {
-          return JSON.parse(cleanLooseJson(slice));
-        } catch {}
+        const obj = safeParseJson(slice);
+        if (obj) return obj;
         start = -1;
       }
     }
   }
   return null;
+}
+
+// 核心转译：将思考与动作拼装为 Claude Code 标准工具调用格式
+function buildClaudeCodeResponse(parsedAction, rawAssistantText) {
+  if (!parsedAction || !parsedAction.action || parsedAction.action === 'finish') {
+    const summary = parsedAction?.params?.summary || parsedAction?.thought || rawAssistantText;
+    return {
+      thought: summary,
+      toolCall: null,
+      fullText: summary
+    };
+  }
+
+  const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+  const toolCallPayload = {
+    name: mappedTool.name,
+    arguments: mappedTool.arguments
+  };
+
+  // 严格遵循规范：不要将 <tool_call> 放进 Markdown 代码块
+  const toolCallBlock = `<tool_call>\n${JSON.stringify(toolCallPayload)}\n</tool_call>`;
+  const thoughtText = parsedAction.thought || `调度 ${mappedTool.name}...`;
+
+  return {
+    thought: thoughtText,
+    toolCall: toolCallPayload,
+    fullText: `${thoughtText}\n\n${toolCallBlock}`
+  };
 }
 
 // ==========================================
@@ -713,7 +744,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
   const { model, messages, stream } = req.body;
-
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
   logger.debug('收到 Claude Code 调度请求', {
     '目标上游': upstreamBase,
@@ -730,13 +760,11 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
-  // 1. 立即握手并开启心跳保活
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
-
     sendSSE('message_start', {
       type: 'message_start',
       message: {
@@ -750,7 +778,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         usage: { input_tokens: 150, output_tokens: 0 }
       }
     });
-
     heartbeatTimer = setInterval(() => {
       if (!res.writableEnded) res.write(': keep-alive\n\n');
     }, 5000);
@@ -758,7 +785,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
 
   try {
     const prompt = buildPrompt(globalTask, historyLogsText);
-
     const onThinkingChunk = (chunk) => {
       if (!stream || !chunk) return;
       if (!thinkingStarted) {
@@ -785,84 +811,37 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     );
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-
     if (stream && thinkingStarted) {
       sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
       blockIndex++;
     }
 
-    // 2. 深度容错解析
+    // 格式编译与转译
     const parsedAction = extractActionAndThought(assistantText);
-    const toolCallId = 'toolu_' + crypto.randomBytes(8).toString('hex');
-    let responseBlocks = [];
-    let stopReason = 'end_turn';
+    const { thought, toolCall, fullText } = buildClaudeCodeResponse(parsedAction, assistantText);
 
-    if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
-      stopReason = 'tool_use';
+    logger.debug('编译完成，准备下发给 Claude Code', {
+      '耗时': `${Date.now() - startTime}ms`,
+      '正文思考': thought,
+      '工具调用': toolCall ? toolCall.name : '无（流程终结）'
+    });
 
-      responseBlocks = [
-        {
-          type: 'text',
-          text: parsedAction.thought || `调度 ${mappedTool.name}...`
-        },
-        {
-          type: 'tool_use',
-          id: toolCallId,
-          name: mappedTool.name,
-          input: mappedTool.arguments
-        }
-      ];
-
-      logger.debug('成功编译 CC 原生工具调用', {
-        '耗时': `${Date.now() - startTime}ms`,
-        '思考内容': parsedAction.thought,
-        '下发原生工具': mappedTool.name,
-        '工具参数': mappedTool.arguments
-      });
-    } else {
-      const summaryText = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
-      responseBlocks = [{ type: 'text', text: summaryText }];
-      stopReason = 'end_turn';
-
-      logger.debug('流程终结或纯文本', {
-        '耗时': `${Date.now() - startTime}ms`,
-        '总结': summaryText.slice(0, 150)
-      });
-    }
-
-    // 3. 回传给 Claude Code
     if (stream) {
-      for (const block of responseBlocks) {
-        sendSSE('content_block_start', {
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: block.type === 'text'
-            ? { type: 'text', text: '' }
-            : { type: 'tool_use', id: block.id, name: block.name, input: {} }
-        });
-
-        if (block.type === 'text') {
-          sendSSE('content_block_delta', {
-            type: 'content_block_delta',
-            index: blockIndex,
-            delta: { type: 'text_delta', text: block.text }
-          });
-        } else {
-          sendSSE('content_block_delta', {
-            type: 'content_block_delta',
-            index: blockIndex,
-            delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) }
-          });
-        }
-
-        sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-        blockIndex++;
-      }
+      sendSSE('content_block_start', {
+        type: 'content_block_start',
+        index: blockIndex,
+        content_block: { type: 'text', text: '' }
+      });
+      sendSSE('content_block_delta', {
+        type: 'content_block_delta',
+        index: blockIndex,
+        delta: { type: 'text_delta', text: fullText }
+      });
+      sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
 
       sendSSE('message_delta', {
         type: 'message_delta',
-        delta: { stop_reason: stopReason, stop_sequence: null },
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
         usage: { output_tokens: 300 }
       });
       sendSSE('message_stop', { type: 'message_stop' });
@@ -870,7 +849,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     } else {
       const content = [];
       if (thinking) content.push({ type: 'thinking', thinking });
-      content.push(...responseBlocks);
+      content.push({ type: 'text', text: fullText });
 
       res.json({
         id: msgId,
@@ -878,7 +857,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         role: 'assistant',
         model,
         content,
-        stop_reason: stopReason,
+        stop_reason: 'end_turn',
         stop_sequence: null,
         usage: { input_tokens: 150, output_tokens: 300 }
       });
@@ -892,16 +871,15 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
 });
 
 // ==========================================
-// 10. OpenWebUI 兼容通道
+// 10. OpenWebUI / OpenAI 兼容通道
 // ==========================================
 app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const startTime = Date.now();
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
   const { model, messages, stream } = req.body;
-
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
-  logger.debug('收到 OpenWebUI 请求', {
+  logger.debug('收到 OpenWebUI/ChatCompletions 请求', {
     目标上游: upstreamBase,
     本次增量输入: latestTurnInput || '（初始启动任务）'
   });
@@ -912,7 +890,6 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
-
     heartbeatTimer = setInterval(() => {
       if (!res.writableEnded) res.write(': keep-alive\n\n');
     }, 5000);
@@ -930,14 +907,12 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
+    // 解析并转译为 Claude Code 标准工具格式
     const parsedAction = extractActionAndThought(assistantText);
-    let finalOutput = assistantText;
-    if (parsedAction && parsedAction.action) {
-      finalOutput = `【思考】: ${parsedAction.thought}\n【调度动作】: ${parsedAction.action}\n\`\`\`json\n${JSON.stringify(parsedAction.params, null, 2)}\n\`\`\``;
-    }
+    const { fullText } = buildClaudeCodeResponse(parsedAction, assistantText);
 
     if (stream) {
-      res.write(`data: ${JSON.stringify({ id: 'chatcmpl-1', choices: [{ delta: { content: finalOutput, reasoning_content: thinking } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: 'chatcmpl-1', choices: [{ delta: { content: fullText, reasoning_content: thinking } }] })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
@@ -946,7 +921,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: [{ message: { role: 'assistant', content: finalOutput, reasoning_content: thinking }, finish_reason: 'stop' }]
+        choices: [{ message: { role: 'assistant', content: fullText, reasoning_content: thinking }, finish_reason: 'stop' }]
       });
     }
   } catch (err) {
