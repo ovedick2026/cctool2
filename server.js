@@ -561,6 +561,7 @@ async function* readSSE(response) {
   }
 }
 
+// 向上游发起纯流式请求，边读边提取，支持 Thinking 流式广播
 async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinkingChunk) {
   const headers = {
     'Content-Type': 'application/json',
@@ -571,7 +572,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
     'Accept': 'text/event-stream, application/json'
   };
 
-  // 优先 messages
+  // 1. 尝试 Anthropic /v1/messages
   try {
     const res = await fetch(`${targetBase}/v1/messages`, {
       method: 'POST',
@@ -605,7 +606,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
     }
   } catch (e) {}
 
-  // 回退 chat/completions
+  // 2. 回退 chat/completions
   const chatRes = await fetch(`${targetBase}/v1/chat/completions`, {
     method: 'POST',
     headers,
@@ -623,6 +624,10 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 
   let fullText = '';
   let thinkingText = '';
+  let inThinkTag = false;
+  const tagOpen = '<' + 'think>';
+  const tagClose = '<' + '/think>';
+
   for await (const chunk of readSSE(chatRes)) {
     if (!chunk || chunk === '[DONE]') continue;
     try {
@@ -634,7 +639,36 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
           thinkingText += think;
           if (onThinkingChunk) onThinkingChunk(think);
         }
-        if (delta.content) fullText += delta.content;
+
+        if (delta.content) {
+          let piece = delta.content;
+          while (piece.length > 0) {
+            if (!inThinkTag) {
+              const start = piece.indexOf(tagOpen);
+              if (start !== -1) {
+                fullText += piece.slice(0, start);
+                inThinkTag = true;
+                piece = piece.slice(start + tagOpen.length);
+              } else {
+                fullText += piece;
+                piece = '';
+              }
+            } else {
+              const end = piece.indexOf(tagClose);
+              if (end !== -1) {
+                const tPiece = piece.slice(0, end);
+                thinkingText += tPiece;
+                if (onThinkingChunk) onThinkingChunk(tPiece);
+                inThinkTag = false;
+                piece = piece.slice(end + tagClose.length);
+              } else {
+                thinkingText += piece;
+                if (onThinkingChunk) onThinkingChunk(piece);
+                piece = '';
+              }
+            }
+          }
+        }
       }
     } catch {}
   }
@@ -682,9 +716,9 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
 
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
   logger.debug('收到 Claude Code 调度请求', {
-    目标上游: upstreamBase,
-    模型: model,
-    本次增量输入: latestTurnInput || '（初始启动任务）'
+    '目标上游': upstreamBase,
+    '模型': model,
+    '本次增量输入': latestTurnInput || '（初始启动任务）'
   });
 
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
@@ -764,7 +798,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     let stopReason = 'end_turn';
 
     if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-      // 成功解析出工具！映射转换为 Claude Code 原生格式
       const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
       stopReason = 'tool_use';
 
@@ -782,20 +815,19 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       ];
 
       logger.debug('成功编译 CC 原生工具调用', {
-        耗时: `${Date.now() - startTime}ms`,
-        【思考内容】: parsedAction.thought,
-        【下发原生工具】: mappedTool.name,
-        【工具参数】: mappedTool.arguments
+        '耗时': `${Date.now() - startTime}ms`,
+        '思考内容': parsedAction.thought,
+        '下发原生工具': mappedTool.name,
+        '工具参数': mappedTool.arguments
       });
     } else {
-      // 纯文本总结或流程终结
       const summaryText = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
       responseBlocks = [{ type: 'text', text: summaryText }];
       stopReason = 'end_turn';
 
       logger.debug('流程终结或纯文本', {
-        耗时: `${Date.now() - startTime}ms`,
-        总结: summaryText.slice(0, 150)
+        '耗时': `${Date.now() - startTime}ms`,
+        '总结': summaryText.slice(0, 150)
       });
     }
 
