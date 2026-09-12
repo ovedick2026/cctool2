@@ -68,26 +68,26 @@ export const DEFAULT_PROMPT_ID = "pipeline-standard";
 // 2. Action 与 Claude Code 原生工具适配映射器
 // ==========================================
 export function mapActionToClaudeCodeTool(actionName, rawParams) {
-  const normAction = String(actionName || '').trim().toLowerCase();
+  const normAction = String(actionName || "").trim().toLowerCase();
   const params = rawParams || {};
 
   // 1. Write: {"file_path", "content"}
-  if (normAction === 'fs_write' || normAction === 'write') {
+  if (normAction === "fs_write" || normAction === "write") {
     return {
-      name: 'Write',
+      name: "Write",
       arguments: {
-        file_path: params.file_path || params.path || 'temp.txt',
-        content: params.content !== undefined ? params.content : ''
+        file_path: params.file_path || params.path || "temp.txt",
+        content: params.content !== undefined ? params.content : ""
       }
     };
   }
 
-  // 2. Read: {"file_path", "limit", "offset", "pages"}
-  if (normAction === 'fs_read' || normAction === 'read') {
+  // 2. Read: {"file_path", "limit", "offset"}
+  if (normAction === "fs_read" || normAction === "read") {
     return {
-      name: 'Read',
+      name: "Read",
       arguments: {
-        file_path: params.file_path || params.path || '',
+        file_path: params.file_path || params.path || "",
         ...(params.limit ? { limit: Number(params.limit) } : {}),
         ...(params.offset ? { offset: Number(params.offset) } : {})
       }
@@ -95,132 +95,132 @@ export function mapActionToClaudeCodeTool(actionName, rawParams) {
   }
 
   // 3. Edit: {"file_path", "old_string", "new_string", "replace_all"}
-  if (normAction === 'fs_replace' || normAction === 'edit') {
+  if (normAction === "fs_replace" || normAction === "edit") {
     return {
-      name: 'Edit',
+      name: "Edit",
       arguments: {
-        file_path: params.file_path || params.path || '',
-        old_string: params.old_string !== undefined ? params.old_string : '',
-        new_string: params.new_string !== undefined ? params.new_string : '',
+        file_path: params.file_path || params.path || "",
+        old_string: params.old_string !== undefined ? params.old_string : "",
+        new_string: params.new_string !== undefined ? params.new_string : "",
         replace_all: Boolean(params.replace_all)
       }
     };
   }
 
   // 4. Bash: {"command"}
-  if (normAction === 'shell_exec' || normAction === 'bash') {
+  if (normAction === "shell_exec" || normAction === "bash") {
     return {
-      name: 'Bash',
+      name: "Bash",
       arguments: {
-        command: params.command || params.cmd || '',
+        command: params.command || params.cmd || "",
         ...(params.description ? { description: params.description } : {})
       }
     };
   }
 
   // 5. AskUserQuestion (严格保留用户决策与选项)
-  if (normAction === 'user_prompt' || normAction === 'askuserquestion') {
+  if (normAction === "user_prompt" || normAction === "askuserquestion") {
     let questions = [];
     if (Array.isArray(params.questions)) {
       questions = params.questions;
     } else {
-      const qText = params.question || params.prompt || '请确认下一步操作：';
-      const rawOptions = Array.isArray(params.options) ? params.options : ['确认', '取消'];
+      const qText = params.question || params.prompt || "请确认下一步操作：";
+      const rawOptions = Array.isArray(params.options) ? params.options : ["确认", "取消"];
       const formattedOptions = rawOptions.map((opt) => {
-        if (typeof opt === 'string') return { label: opt, description: opt };
-        return { label: opt.label || '选项', description: opt.description || opt.label || '' };
+        if (typeof opt === "string") return { label: opt, description: opt };
+        return { label: opt.label || "选项", description: opt.description || opt.label || "" };
       });
 
       questions = [
         {
           question: qText,
-          header: params.header || '决策确认',
+          header: params.header || "决策确认",
           multiSelect: Boolean(params.multiSelect),
           options: formattedOptions
         }
       ];
     }
-    return { name: 'AskUserQuestion', arguments: { questions } };
+    return { name: "AskUserQuestion", arguments: { questions } };
   }
 
   // 6. WebSearch
-  if (normAction === 'net_search' || normAction === 'websearch') {
-    return { name: 'WebSearch', arguments: { query: params.query || '' } };
+  if (normAction === "net_search" || normAction === "websearch") {
+    return { name: "WebSearch", arguments: { query: params.query || "" } };
   }
 
   // 7. WebFetch
-  if (normAction === 'net_fetch' || normAction === 'webfetch') {
+  if (normAction === "net_fetch" || normAction === "webfetch") {
     return {
-      name: 'WebFetch',
+      name: "WebFetch",
       arguments: {
-        url: params.url || '',
-        prompt: params.prompt || '提取关键内容'
+        url: params.url || "",
+        prompt: params.prompt || "提取关键内容"
       }
     };
   }
 
   // 8. Agent
-  if (normAction === 'subflow_spawn' || normAction === 'agent') {
+  if (normAction === "subflow_spawn" || normAction === "agent") {
     return {
-      name: 'Agent',
+      name: "Agent",
       arguments: {
-        description: params.title || params.description || 'Sub-agent task',
-        prompt: params.instructions || params.prompt || ''
+        description: params.title || params.description || "Sub-agent task",
+        prompt: params.instructions || params.prompt || ""
       }
     };
   }
 
   // 9. TaskCreate / TaskUpdate
-  if (normAction === 'task_entry' || normAction === 'taskcreate' || normAction === 'taskupdate') {
-    if (params.action === 'update' || params.taskId) {
+  if (normAction === "task_entry" || normAction === "taskcreate" || normAction === "taskupdate") {
+    if (params.action === "update" || params.taskId) {
       return {
-        name: 'TaskUpdate',
+        name: "TaskUpdate",
         arguments: {
           taskId: params.taskId || params.task_id,
-          status: params.status || 'completed'
+          status: params.status || "completed"
         }
       };
     }
     return {
-      name: 'TaskCreate',
+      name: "TaskCreate",
       arguments: {
-        subject: params.title || params.subject || '任务',
-        description: params.description || ''
+        subject: params.title || params.subject || "任务",
+        description: params.description || ""
       }
     };
   }
 
   // 10. NotebookEdit
-  if (normAction === 'notebook_patch' || normAction === 'notebookedit') {
+  if (normAction === "notebook_patch" || normAction === "notebookedit") {
     return {
-      name: 'NotebookEdit',
+      name: "NotebookEdit",
       arguments: {
-        notebook_path: params.notebook_path || '',
-        cell_id: params.cell_id || '',
-        edit_mode: params.edit_mode || 'replace',
-        new_source: params.new_source || ''
+        notebook_path: params.notebook_path || "",
+        cell_id: params.cell_id || "",
+        edit_mode: params.edit_mode || "replace",
+        new_source: params.new_source || ""
       }
     };
   }
 
   // 11. EnterWorktree
-  if (normAction === 'git_worktree' || normAction === 'enterworktree') {
+  if (normAction === "git_worktree" || normAction === "enterworktree") {
     return {
-      name: 'EnterWorktree',
-      arguments: { name: params.name || 'worktree', path: params.path || '' }
+      name: "EnterWorktree",
+      arguments: { name: params.name || "worktree", path: params.path || "" }
     };
   }
 
   // 12. ReportFindings
-  if (normAction === 'code_audit' || normAction === 'reportfindings') {
+  if (normAction === "code_audit" || normAction === "reportfindings") {
     return {
-      name: 'ReportFindings',
-      arguments: { findings: params.findings || [], level: params.level || 'medium' }
+      name: "ReportFindings",
+      arguments: { findings: params.findings || [], level: params.level || "medium" }
     };
   }
 
   // 兜底 Bash
-  return { name: 'Bash', arguments: params };
+  return { name: "Bash", arguments: params };
 }
 
 // ==========================================
@@ -229,36 +229,36 @@ export function mapActionToClaudeCodeTool(actionName, rawParams) {
 const CORE_DOCS_REGEX = /(?:^|[/\s"'\`\\])(?:todo|readme)\.(?:md|markdown|txt)(?:[/\s"'\`\\]|$)/i;
 
 export function sanitizeWhitespace(text) {
-  if (!text || typeof text !== 'string') return '';
+  if (!text || typeof text !== "string") return "";
   return text
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/[ \t]+$/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
 export function stripClientNoise(text) {
-  if (!text || typeof text !== 'string') return '';
+  if (!text || typeof text !== "string") return "";
   const cleaned = text
-    .replace(/REMINDER:\s*You MUST include the sources[\s\S]*?hyperlinks\./gi, '')
-    .replace(/Wasted call\s*—\s*file unchanged[\s\S]*?instead\./gi, '[SUCCESS] 文件未修改，状态已是最新。')
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
-    .replace(/<total_tokens>[\s\S]*?<\/total_tokens>/gi, '')
-    .replace(/<task-notification>[\s\S]*?<\/task-notification>/gi, '')
-    .replace(/<context>[\s\S]*?<\/context>/gi, '');
+    .replace(/REMINDER:\s*You MUST include the sources[\s\S]*?hyperlinks\./gi, "")
+    .replace(/Wasted call\s*—\s*file unchanged[\s\S]*?instead\./gi, "[SUCCESS] 文件未修改，状态已是最新。")
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
+    .replace(/<total_tokens>[\s\S]*?<\/total_tokens>/gi, "")
+    .replace(/<task-notification>[\s\S]*?<\/task-notification>/gi, "")
+    .replace(/<context>[\s\S]*?<\/context>/gi, "");
   return sanitizeWhitespace(cleaned);
 }
 
 // 提取 fs_read 的分段特征键，保证不同片段互补保留
 export function extractSliceKey(params = {}) {
-  const offset = params.offset ?? params.start ?? params.start_line ?? '';
-  const limit = params.limit ?? params.length ?? params.end ?? params.end_line ?? '';
-  if (offset === '' && limit === '') return 'full';
+  const offset = params.offset ?? params.start ?? params.start_line ?? "";
+  const limit = params.limit ?? params.length ?? params.end ?? params.end_line ?? "";
+  if (offset === "" && limit === "") return "full";
   return `range:${offset}-${limit}`;
 }
 
-export function smartTruncateLog(text, limit, label = '终端日志') {
+export function smartTruncateLog(text, limit, label = "终端日志") {
   if (text.length <= limit) return text;
 
   const headSize = Math.max(400, Math.floor(limit * 0.35));
@@ -268,7 +268,7 @@ export function smartTruncateLog(text, limit, label = '终端日志') {
   const tailPart = text.slice(-tailSize);
   const middleContent = text.slice(headSize, -tailSize);
 
-  const lines = middleContent.split('\n');
+  const lines = middleContent.split("\n");
   const errorIndicators = [
     /error/i,
     /exception/i,
@@ -290,7 +290,7 @@ export function smartTruncateLog(text, limit, label = '终端日志') {
   const removed = text.length - headSize - tailSize;
   let summary = `\n...[${label}中间输出已折叠 ${removed} 字符`;
   if (capturedLines.length > 0) {
-    summary += `，提取关键异常信号：\n${capturedLines.slice(0, 8).join('\n')}\n...折叠结束]...\n`;
+    summary += `，提取关键异常信号：\n${capturedLines.slice(0, 8).join("\n")}\n...折叠结束]...\n`;
   } else {
     summary += `]...\n`;
   }
@@ -298,54 +298,47 @@ export function smartTruncateLog(text, limit, label = '终端日志') {
   return `${headPart}${summary}${tailPart}`;
 }
 
-/**
- * 格式化执行反馈：
- * 1. isLatestStep === true 享有最高豁免权，100% 完整原样保留，绝对不截断！
- * 2. user_prompt 决策 100% 完整保留。
- * 3. 核心文档（TODO / README）或包含待办清单语法的给予 25,000+ 字符超高配额。
- */
 export function formatLocalFeedback(str, actionName, stepParams = {}, isLatestStep = false, stepAge = 0) {
-  if (!str) return '[SUCCESS] 操作已执行完成';
+  if (!str) return "[SUCCESS] 操作已执行完成";
   const text = sanitizeWhitespace(String(str));
 
-  // 【核心铁律 1】：最后一步工具结果绝对无损
+  // 【核心铁律 1】：最后一步工具结果绝对保真，原样保留
   if (isLatestStep) {
     return text;
   }
 
-  // 【核心铁律 2】：用户决策交互无损
-  if (actionName === 'user_prompt' || actionName === 'AskUserQuestion') {
+  // 【核心铁律 2】：用户决策交互 100% 完整保留
+  if (actionName === "user_prompt" || actionName === "AskUserQuestion") {
     return text;
   }
 
-  const cmdStr = String(stepParams.command || stepParams.cmd || '');
-  const pathStr = String(stepParams.file_path || stepParams.path || '');
+  const cmdStr = String(stepParams.command || stepParams.cmd || "");
+  const pathStr = String(stepParams.file_path || stepParams.path || "");
   const isTargetDocFile = CORE_DOCS_REGEX.test(pathStr) || CORE_DOCS_REGEX.test(cmdStr);
   const hasChecklistMarks = /- \[[ xX]\]/m.test(text);
 
   // 【核心铁律 3】：核心任务清单/规划文档超大配额保护
   if (isTargetDocFile || hasChecklistMarks) {
     if (text.length <= 25000) return text;
-    return smartTruncateLog(text, 25000, '核心任务/设计文档');
+    return smartTruncateLog(text, 25000, "核心任务/设计文档");
   }
 
-  // 历史深层梯度预算
   let budget = stepAge <= 2 ? 6000 : 2500;
-  if (actionName === 'fs_read') {
-    if (text.length > budget) return smartTruncateLog(text, budget, '文件读取');
-  } else if (actionName === 'shell_exec' || actionName === 'Bash') {
-    if (text.length > budget) return smartTruncateLog(text, budget, '命令输出');
-  } else if (actionName !== 'fs_write' && text.length > budget) {
-    return smartTruncateLog(text, budget, '执行反馈');
+  if (actionName === "fs_read") {
+    if (text.length > budget) return smartTruncateLog(text, budget, "文件读取");
+  } else if (actionName === "shell_exec" || actionName === "Bash") {
+    if (text.length > budget) return smartTruncateLog(text, budget, "命令输出");
+  } else if (actionName !== "fs_write" && text.length > budget) {
+    return smartTruncateLog(text, budget, "执行反馈");
   }
 
   return text;
 }
 
 export function compressHistorySteps(rawSteps) {
-  const validSteps = (rawSteps || []).filter((s) => s.action && s.action !== 'text_response');
+  const validSteps = (rawSteps || []).filter((s) => s.action && s.action !== "text_response");
   if (validSteps.length === 0) {
-    return '（当前为初始化阶段，尚无历史记录）';
+    return "（当前为初始化阶段，尚无历史记录）";
   }
 
   const trimmed = validSteps.slice(-8);
@@ -356,12 +349,12 @@ export function compressHistorySteps(rawSteps) {
 
   trimmed.forEach((s, idx) => {
     const p = s.params || {};
-    const path = String(p.file_path || p.path || '').toLowerCase();
+    const path = String(p.file_path || p.path || "").toLowerCase();
     if (!path) return;
 
-    if (s.action === 'fs_write' || s.action === 'fs_replace') {
+    if (s.action === "fs_write" || s.action === "fs_replace") {
       fileLastWriteIdx.set(path, idx);
-    } else if (s.action === 'fs_read') {
+    } else if (s.action === "fs_read") {
       const sliceKey = extractSliceKey(p);
       readSliceMap.set(`${path}|${sliceKey}`, idx);
     }
@@ -371,34 +364,34 @@ export function compressHistorySteps(rawSteps) {
     .map((step, idx) => {
       const stepAge = total - 1 - idx;
       const isLatestStep = stepAge === 0;
-      let feedback = step.feedback || '[SUCCESS] 执行完成';
+      let feedback = step.feedback || "[SUCCESS] 执行完成";
       let params = { ...step.params };
-      const filePathStr = String(params.file_path || params.path || '');
+      const filePathStr = String(params.file_path || params.path || "");
       const lowerPath = filePathStr.toLowerCase();
 
       const isTodoFile = /(?:^|[/\\])todo\.(?:md|markdown|txt)$/i.test(filePathStr);
       const isReadmeFile = /(?:^|[/\\])readme\.(?:md|markdown|txt)$/i.test(filePathStr);
 
       // 1. fs_write 历史步骤骨架化
-      if (step.action === 'fs_write' && !isLatestStep) {
+      if (step.action === "fs_write" && !isLatestStep) {
         if (isTodoFile) {
           params = {
-            file_path: params.file_path || 'todo.md',
-            content: step.params?.content || ''
+            file_path: params.file_path || "todo.md",
+            content: step.params?.content || ""
           };
         } else if (isReadmeFile) {
-          const contentStr = String(step.params?.content || '');
+          const contentStr = String(step.params?.content || "");
           if (contentStr.length <= 4000) {
-            params = { file_path: params.file_path || 'readme.md', content: contentStr };
+            params = { file_path: params.file_path || "readme.md", content: contentStr };
           } else {
             params = {
-              file_path: params.file_path || 'readme.md',
+              file_path: params.file_path || "readme.md",
               content: `[项目规划与设计规范已写入，共 ${contentStr.length} 字符]`
             };
           }
         } else {
           const len = step.params?.content ? String(step.params.content).length : 0;
-          params = { file_path: params.file_path || 'file' };
+          params = { file_path: params.file_path || "file" };
           if (len > 0) {
             params.content = `[源码/文档内容已写入，共 ${len} 字符]`;
           }
@@ -406,21 +399,21 @@ export function compressHistorySteps(rawSteps) {
       }
 
       // 2. fs_replace 精简
-      if (step.action === 'fs_replace' && !isLatestStep) {
+      if (step.action === "fs_replace" && !isLatestStep) {
         if (!isTodoFile && !isReadmeFile) {
           if (params.old_string?.length > 100) {
             params.old_string =
-              params.old_string.slice(0, 40) + '...[略]...' + params.old_string.slice(-30);
+              params.old_string.slice(0, 40) + "...[略]..." + params.old_string.slice(-30);
           }
           if (params.new_string?.length > 100) {
             params.new_string =
-              params.new_string.slice(0, 40) + '...[略]...' + params.new_string.slice(-30);
+              params.new_string.slice(0, 40) + "...[略]..." + params.new_string.slice(-30);
           }
         }
       }
 
-      // 3. fs_read 分段读取感知
-      if (step.action === 'fs_read' && !isLatestStep) {
+      // 3. fs_read 分段感知
+      if (step.action === "fs_read" && !isLatestStep) {
         const sliceKey = extractSliceKey(params);
         const lastWriteAt = fileLastWriteIdx.get(lowerPath);
         const lastReadAt = readSliceMap.get(`${lowerPath}|${sliceKey}`);
@@ -430,7 +423,7 @@ export function compressHistorySteps(rawSteps) {
         } else if (lastReadAt !== undefined && lastReadAt > idx) {
           feedback = `[早期相同分段已读取，第 ${lastReadAt + 1} 步有最新读取结果，此处折叠]`;
         } else {
-          feedback = formatLocalFeedback(feedback, 'fs_read', params, isLatestStep, stepAge);
+          feedback = formatLocalFeedback(feedback, "fs_read", params, isLatestStep, stepAge);
         }
       } else {
         feedback = formatLocalFeedback(feedback, step.action, params, isLatestStep, stepAge);
@@ -449,7 +442,7 @@ ${JSON.stringify(
 【本地执行反馈】：
 ${feedback}`;
     })
-    .join('\n\n');
+    .join("\n\n");
 }
 
 // ==========================================
@@ -460,17 +453,17 @@ function rewriteCompactionTextToPipeline(rawText) {
     return null;
   }
 
-  let extractedGoal = '继续推进项目核心目标与未完工任务。';
+  let extractedGoal = "继续推进项目核心目标与未完工任务。";
   const goalMatch = rawText.match(/User's sole explicit message[^:]*:\s*["“]([^"”\n]+)["”]/i);
   if (goalMatch) {
     extractedGoal = goalMatch[1].trim();
   }
 
-  let currentTaskIntent = '结合已有文件状态继续完成下一项计划。';
+  let currentTaskIntent = "结合已有文件状态继续完成下一项计划。";
   const taskIntentMatch = rawText.match(/Task\s*([0-9a-zA-Z._-]+)?\s*intent[^:]*:\s*([^\n]+)/i);
   if (taskIntentMatch) {
     currentTaskIntent =
-      (taskIntentMatch[1] ? `[任务 ${taskIntentMatch[1]}] ` : '') + taskIntentMatch[2].trim();
+      (taskIntentMatch[1] ? `[任务 ${taskIntentMatch[1]}] ` : "") + taskIntentMatch[2].trim();
   }
 
   return `【流水线断点续接指令】：
@@ -484,35 +477,35 @@ function rewriteCompactionTextToPipeline(rawText) {
 }
 
 export function parseConversation(messages = []) {
-  let globalTask = '';
+  let globalTask = "";
   const rawSteps = [];
 
   const CC_TO_ACTION_MAP = {
-    Write: 'fs_write',
-    Read: 'fs_read',
-    Edit: 'fs_replace',
-    Bash: 'shell_exec',
-    WebSearch: 'net_search',
-    WebFetch: 'net_fetch',
-    AskUserQuestion: 'user_prompt',
-    Agent: 'subflow_spawn',
-    Workflow: 'subflow_spawn',
-    TaskCreate: 'task_entry',
-    TaskUpdate: 'task_entry',
-    NotebookEdit: 'notebook_patch',
-    EnterWorktree: 'git_worktree',
-    ReportFindings: 'code_audit'
+    Write: "fs_write",
+    Read: "fs_read",
+    Edit: "fs_replace",
+    Bash: "shell_exec",
+    WebSearch: "net_search",
+    WebFetch: "net_fetch",
+    AskUserQuestion: "user_prompt",
+    Agent: "subflow_spawn",
+    Workflow: "subflow_spawn",
+    TaskCreate: "task_entry",
+    TaskUpdate: "task_entry",
+    NotebookEdit: "notebook_patch",
+    EnterWorktree: "git_worktree",
+    ReportFindings: "code_audit"
   };
 
   for (const msg of messages) {
-    if (msg.role === 'user') {
-      let rawText = '';
-      if (typeof msg.content === 'string') rawText = msg.content;
+    if (msg.role === "user") {
+      let rawText = "";
+      if (typeof msg.content === "string") rawText = msg.content;
       else if (Array.isArray(msg.content)) {
         rawText = msg.content
-          .filter((c) => c.type === 'text')
+          .filter((c) => c.type === "text")
           .map((c) => c.text)
-          .join('\n');
+          .join("\n");
       }
 
       const pipelineResume = rewriteCompactionTextToPipeline(rawText);
@@ -524,16 +517,16 @@ export function parseConversation(messages = []) {
       const clean = stripClientNoise(rawText);
       if (
         clean &&
-        !clean.startsWith('<tool_result') &&
+        !clean.startsWith("<tool_result") &&
         !clean.includes("Today's date is") &&
-        !clean.startsWith('{')
+        !clean.startsWith("{")
       ) {
         globalTask = clean;
         break;
       }
     }
   }
-  if (!globalTask) globalTask = '推进当前工作目录下的任务推进。';
+  if (!globalTask) globalTask = "推进当前工作目录下的任务推进。";
 
   const pendingSteps = new Map();
   const sequentialQueue = [];
@@ -541,13 +534,13 @@ export function parseConversation(messages = []) {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
 
-    if (msg.role === 'assistant') {
+    if (msg.role === "assistant") {
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
-          if (p.type === 'tool_use') {
-            const mappedAction = CC_TO_ACTION_MAP[p.name] || 'shell_exec';
+          if (p.type === "tool_use") {
+            const mappedAction = CC_TO_ACTION_MAP[p.name] || "shell_exec";
             const stepObj = {
-              id: p.id || '',
+              id: p.id || "",
               action: mappedAction,
               params: p.input || {}
             };
@@ -559,19 +552,19 @@ export function parseConversation(messages = []) {
 
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
-          const fnName = tc.function?.name || '';
-          const mappedAction = CC_TO_ACTION_MAP[fnName] || 'shell_exec';
+          const fnName = tc.function?.name || "";
+          const mappedAction = CC_TO_ACTION_MAP[fnName] || "shell_exec";
           let params = {};
           try {
             params =
-              typeof tc.function?.arguments === 'string'
+              typeof tc.function?.arguments === "string"
                 ? JSON.parse(tc.function.arguments)
                 : tc.function?.arguments || {};
           } catch {
             params = {};
           }
           const stepObj = {
-            id: tc.id || '',
+            id: tc.id || "",
             action: mappedAction,
             params
           };
@@ -579,7 +572,7 @@ export function parseConversation(messages = []) {
           sequentialQueue.push(stepObj);
         }
       }
-    } else if (msg.role === 'user' || msg.role === 'tool') {
+    } else if (msg.role === "user" || msg.role === "tool") {
       const matchAndPopStep = (toolCallId) => {
         if (toolCallId && pendingSteps.has(toolCallId)) {
           const step = pendingSteps.get(toolCallId);
@@ -593,25 +586,25 @@ export function parseConversation(messages = []) {
 
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
-          if (p.type === 'tool_result') {
+          if (p.type === "tool_result") {
             const outText =
-              typeof p.content === 'string'
+              typeof p.content === "string"
                 ? p.content
-                : p.content?.map((c) => c.text).join('\n') || '';
+                : p.content?.map((c) => c.text).join("\n") || "";
             const matchedStep = matchAndPopStep(p.tool_use_id);
             if (matchedStep) {
               rawSteps.push({ ...matchedStep, feedback: stripClientNoise(outText) });
             }
           }
         }
-      } else if (msg.role === 'tool' && msg.tool_call_id) {
+      } else if (msg.role === "tool" && msg.tool_call_id) {
         const outText =
-          typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+          typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
         const matchedStep = matchAndPopStep(msg.tool_call_id);
         if (matchedStep) {
           rawSteps.push({ ...matchedStep, feedback: stripClientNoise(outText) });
         }
-      } else if (typeof msg.content === 'string') {
+      } else if (typeof msg.content === "string") {
         const text = stripClientNoise(msg.content);
         if (text && !text.startsWith("Today's date is") && sequentialQueue.length > 0) {
           const matchedStep = matchAndPopStep(null);
@@ -625,7 +618,7 @@ export function parseConversation(messages = []) {
 
   const historyLogsText = compressHistorySteps(rawSteps);
   const latestTurnInput =
-    rawSteps.length > 0 ? rawSteps[rawSteps.length - 1].feedback : '（初始启动任务）';
+    rawSteps.length > 0 ? rawSteps[rawSteps.length - 1].feedback : "（初始启动任务）";
 
   return { globalTask, historyLogsText, latestTurnInput };
 }
@@ -634,7 +627,10 @@ export function parseConversation(messages = []) {
 // 5. 模型回复容错解析与动作提取
 // ==========================================
 export function cleanLooseJson(str) {
-  return str.replace(/,\s*([}\]])/g, '$1').replace(/\r\n/g, '\n').trim();
+  return String(str || "")
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(/\r\n/g, "\n")
+    .trim();
 }
 
 export function safeParseJson(str) {
@@ -645,7 +641,7 @@ export function safeParseJson(str) {
   } catch (e) {
     try {
       const fixed = clean.replace(/:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_, p1) => {
-        return ': "' + p1.replace(/\r?\n/g, '\\n') + '"';
+        return ': "' + p1.replace(/\r?\n/g, "\\n") + '"';
       });
       return JSON.parse(fixed);
     } catch (e2) {
@@ -657,24 +653,24 @@ export function safeParseJson(str) {
 export function scanBalancedJsonObject(text) {
   let depth = 0;
   let inStr = false;
-  let quoteChar = '';
+  let quoteChar = "";
   let escape = false;
   let start = -1;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (inStr) {
       if (escape) escape = false;
-      else if (ch === '\\') escape = true;
+      else if (ch === "\\") escape = true;
       else if (ch === quoteChar) inStr = false;
       continue;
     }
     if (ch === '"' || ch === "'") {
       inStr = true;
       quoteChar = ch;
-    } else if (ch === '{') {
+    } else if (ch === "{") {
       if (depth === 0) start = i;
       depth++;
-    } else if (ch === '}') {
+    } else if (ch === "}") {
       depth--;
       if (depth === 0 && start !== -1) {
         const slice = text.slice(start, i + 1);
@@ -688,9 +684,9 @@ export function scanBalancedJsonObject(text) {
 }
 
 export function extractActionAndThought(rawText) {
-  if (!rawText || typeof rawText !== 'string') return null;
-  let thought = '';
-  let action = '';
+  if (!rawText || typeof rawText !== "string") return null;
+  let thought = "";
+  let action = "";
   let params = {};
 
   const thoughtMatch = rawText.match(
@@ -714,7 +710,7 @@ export function extractActionAndThought(rawText) {
     parsedJson = scanBalancedJsonObject(rawText);
   }
 
-  if (parsedJson && typeof parsedJson === 'object') {
+  if (parsedJson && typeof parsedJson === "object") {
     if (parsedJson.action) {
       action = parsedJson.action;
       thought = parsedJson.step_thought || parsedJson.thought || thought;
@@ -726,16 +722,16 @@ export function extractActionAndThought(rawText) {
     } else if (action) {
       params = parsedJson;
     } else if (parsedJson.file_path && parsedJson.content !== undefined) {
-      action = 'fs_write';
+      action = "fs_write";
       params = parsedJson;
     } else if (parsedJson.command) {
-      action = 'shell_exec';
+      action = "shell_exec";
       params = parsedJson;
     } else if (parsedJson.file_path && parsedJson.old_string !== undefined) {
-      action = 'fs_replace';
+      action = "fs_replace";
       params = parsedJson;
     } else if (parsedJson.file_path) {
-      action = 'fs_read';
+      action = "fs_read";
       params = parsedJson;
     }
   }
@@ -745,21 +741,21 @@ export function extractActionAndThought(rawText) {
   }
 
   return {
-    thought: thought || '执行当前流水线步骤...',
-    action: action || 'finish',
+    thought: thought || "执行当前流水线步骤...",
+    action: action || "finish",
     params: params || {}
   };
 }
 
 export function splitThinking(raw) {
-  const source = String(raw || '');
+  const source = String(raw || "");
   const matched = source.match(/<think>([\s\S]*?)<\/think>/i);
   const text = source
-    .replace(/[\s\S]*?<\/think>/gi, '')
-    .replace(/[\s\S]*/gi, '')
+    .replace(/[\s\S]*?<\/think>/gi, "")
+    .replace(/[\s\S]*/gi, "")
     .trim();
   return {
     text,
-    thinking: matched ? matched[1].trim() : ''
+    thinking: matched ? matched[1].trim() : ""
   };
 }
