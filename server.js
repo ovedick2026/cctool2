@@ -1,5 +1,6 @@
+```javascript
 /* ==========================================================================
- *  server.js —— 【通讯骨架层 (完整保留 URL 校验、Passthrough 与 Undici 超长连接)】
+ *  server.js —— 【生产级代理通讯骨架层 (统一上游 completions + 5s 保活心跳)】
  * ========================================================================== */
 import express from "express";
 import crypto from "node:crypto";
@@ -8,7 +9,6 @@ import net from "node:net";
 import { Agent, setGlobalDispatcher } from "undici";
 import * as adapt from "./adapt.js";
 
-// 1. 底层网络配置：IPv4 优先，40 分钟超长连接防断开
 dns.setDefaultResultOrder("ipv4first");
 setGlobalDispatcher(
   new Agent({
@@ -20,14 +20,12 @@ setGlobalDispatcher(
 
 const PORT = Number(process.env.PORT || 7860);
 const ALLOW_HTTP = false;
-const ALLOWED_HOSTS = [];
-const UPSTREAM_MAX_ATTEMPTS = 2;
 const UPSTREAM_TIMEOUT_MS = 2400000;
-const RETRY_MAX_DELAY_MS = 30000;
+const UPSTREAM_MAX_ATTEMPTS = 2;
 const CONNECT_MAX_ATTEMPTS = 3;
 
 // ==========================================
-// 2. 结构化彩色控制台日志 (简单明了，便于直接复制排查)
+// 1. 控制台结构化日志输出
 // ==========================================
 function getLogTime() {
   return new Date().toISOString().replace("T", " ").substring(0, 19);
@@ -35,7 +33,7 @@ function getLogTime() {
 
 const logger = {
   info: (tag, msg, extra = {}) => {
-    console.log(`\x1b[36m[${getLogTime()}]\x1b[0m \x1b[32m【${tag}】\x1b[0m ${msg}`);
+    console.log(`\n\x1b[36m[${getLogTime()}]\x1b[0m \x1b[32m【${tag}】\x1b[0m ${msg}`);
     for (const [k, v] of Object.entries(extra)) {
       if (v !== undefined && v !== null) {
         const valStr = typeof v === "object" ? JSON.stringify(v) : String(v);
@@ -44,17 +42,18 @@ const logger = {
     }
   },
   warn: (tag, msg, extra = {}) => {
-    console.warn(`\x1b[33m[${getLogTime()}] ⚠️ 【${tag}】 ${msg}\x1b[0m`);
+    console.warn(`\n\x1b[33m[${getLogTime()}] ⚠️ 【${tag}】 ${msg}\x1b[0m`);
     for (const [k, v] of Object.entries(extra)) {
       console.warn(`  ▶ ${k}:`, v);
     }
   },
   error: (tag, msg, err = null) => {
-    console.error(`\x1b[31m[${getLogTime()}] ❌ 【${tag}】 ${msg}\x1b[0m`, err || "");
+    console.error(`\n\x1b[31m[${getLogTime()}] ❌ 【${tag}】 ${msg}\x1b[0m`, err || "");
   }
 };
 
 const app = express();
+
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader(
@@ -64,21 +63,27 @@ app.use((req, res, next) => {
       "Content-Type",
       "x-api-key",
       "anthropic-version",
-      "anthropic-auth-token"
+      "anthropic-auth-token",
+      "x-tool-bridge-auth-mode"
     ].join(", ")
   );
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
+
 app.use(express.json({ limit: "100mb" }));
 
 // ==========================================
-// 3. 主路由入口 (完整保留 old 的目标 URL 动态提取与 SSRF 保护)
+// 2. 主路由调度器
 // ==========================================
 app.use(async (req, res) => {
   const requestId = crypto.randomUUID().slice(0, 8);
   try {
+    if (req.method === "GET" && req.path === "/healthz") {
+      return res.json({ ok: true, status: "ready" });
+    }
+
     const targetUrl = parseTargetFromPath(req);
     if (!targetUrl) {
       return res.status(404).json({
@@ -88,10 +93,11 @@ app.use(async (req, res) => {
         }
       });
     }
+
     await validateTargetUrl(targetUrl, req);
     const pathname = targetUrl.pathname.replace(/\/+$/, "") || "/";
 
-    // 1. 获取模型列表 —— 绝对透传上游，杜绝假数据！
+    // 1. 模型列表端点 —— 完整原样透传真实上游
     if (req.method === "GET" && pathname.endsWith("/v1/models")) {
       return await passthroughRequest(req, res, requestId, targetUrl);
     }
@@ -102,57 +108,68 @@ app.use(async (req, res) => {
       return res.json({ input_tokens: Math.max(1, Math.ceil(bodyText.length / 4)) });
     }
 
-    // 3. Claude Code /v1/messages 主调度入口
-    if (req.method === "POST" && (pathname.endsWith("/v1/messages") || pathname.endsWith("/v1/message"))) {
+    // 3. Claude Code / Anthropic messages 端点
+    if (
+      req.method === "POST" &&
+      (pathname.endsWith("/v1/messages") || pathname.endsWith("/v1/message"))
+    ) {
       return await handleAnthropicMessages(req, res, requestId, targetUrl);
     }
 
-    // 4. 其他常规请求原样透传
+    // 4. 其他端点直接透传
     return await passthroughRequest(req, res, requestId, targetUrl);
   } catch (error) {
     const status = Number(error?.status) || 502;
-    logger.error("请求失败", `${req.method} ${req.url} -> ${error?.message}`);
-    if (!res.headersSent) {
-      return res.status(status).json({
-        error: { type: "api_error", message: error?.message || "Bridge request failed." }
-      });
-    } else {
-      res.end();
+    logger.error("请求失败", error?.message);
+    if (res.headersSent) {
+      try {
+        res.write(
+          `event: error\ndata: ${JSON.stringify({
+            type: "error",
+            error: { type: "api_error", message: error?.message }
+          })}\n\n`
+        );
+        res.end();
+      } catch {}
+      return;
     }
+    return res.status(status).json({
+      error: {
+        type: "api_error",
+        message: error?.message || "Bridge request failed."
+      }
+    });
   }
 });
 
 // ==========================================
-// 4. 核心调度处理 (统一走 /v1/chat/completions + 5s心跳保活)
+// 3. Anthropic Messages 主处理器
 // ==========================================
 async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   const startTime = Date.now();
   const body = req.body || {};
   const isClientStream = body.stream === true;
-  const messages = body.messages || [];
+  const { globalTask, historyLogsText, latestTurnInput } = adapt.parseConversation(
+    body.messages || []
+  );
 
-  // 1. 智能压缩与流水线提示词组装
-  const { globalTask, historyLogsText, latestTurnInput } = adapt.parseConversation(messages);
-  const finalPrompt = adapt.buildPrompt(globalTask, historyLogsText);
-
-  logger.info("收到 CC 调度请求", body.model || "claude-sonnet", {
+  logger.info("收到 CC 调度请求", body.model || "default", {
     上游目标: originalTargetUrl.origin,
     本次增量输入: latestTurnInput.slice(0, 100),
-    是否流式: isClientStream
+    客户端流式: isClientStream
   });
 
-  const clientAbortController = new AbortController();
-  req.on("close", () => clientAbortController.abort());
-
-  const msgId = `msg_${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
-  let heartbeatTimer = null;
+  const msgId = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
   let blockIndex = 0;
+  let heartbeatTimer = null;
 
   const sendSSE = (event, data) => {
-    if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (!res.writableEnded) {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
   };
 
-  // 2. 建立 SSE 连接并启动 5 秒定时注释保活心跳
+  // 1. 初始化客户端 SSE 并在后台开启 5 秒心跳保活
   if (isClientStream) {
     res.status(200);
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -166,7 +183,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
         id: msgId,
         type: "message",
         role: "assistant",
-        model: body.model || "claude-sonnet-x",
+        model: body.model || "claude-3-7-sonnet",
         content: [],
         stop_reason: null,
         stop_sequence: null,
@@ -174,6 +191,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       }
     });
 
+    // 【核心心跳保活】：每 5 秒发送注释行，防止长文本推理导致客户端超时断连重发
     heartbeatTimer = setInterval(() => {
       try {
         if (!res.writableEnded) {
@@ -187,31 +205,44 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     }, 5000);
   }
 
+  const clientAbortController = new AbortController();
+  req.on("close", () => {
+    clientAbortController.abort();
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+  });
+
   try {
-    // 3. 改写目标为 /v1/chat/completions 统一调用上游
+    // 2. 构造流水线提示词
+    const prompt = adapt.buildPrompt(globalTask, historyLogsText);
+
+    // 3. 转换为 OpenAI /v1/chat/completions 格式请求上游
     const upstreamUrl = rewriteAnthropicMessagesToOpenAI(originalTargetUrl);
     const openAIBody = {
       model: body.model || "claude-3-7-sonnet-20250219",
-      messages: [{ role: "user", content: finalPrompt }],
-      temperature: body.temperature,
-      top_p: body.top_p,
+      messages: [{ role: "user", content: prompt }],
       stream: true
     };
 
-    const upstreamResponse = await fetchUpstreamStreamWithRetry(requestId, upstreamUrl, {
-      method: "POST",
-      headers: {
-        ...buildUpstreamHeaders(req),
-        "Content-Type": "application/json",
-        Accept: "text/event-stream, application/json"
-      },
-      body: JSON.stringify(openAIBody),
-      signal: clientAbortController.signal
-    });
+    const upstreamResponse = await fetchUpstreamStreamWithRetry(
+      requestId,
+      upstreamUrl,
+      {
+        method: "POST",
+        headers: {
+          ...buildUpstreamHeaders(req),
+          "Content-Type": "application/json",
+          Accept: "text/event-stream, application/json"
+        },
+        body: JSON.stringify(openAIBody),
+        signal: clientAbortController.signal
+      }
+    );
 
-    // 4. 流式收集上游正文（抑制 Thinking 转发给客户端）
+    // 4. 读取上游 SSE，抑制 Thinking 不回传客户端
     let rawContentText = "";
     let inThinkTag = false;
+    const tagOpen = "";
+    const tagClose = "</think>";
 
     for await (const { data } of readSSE(upstreamResponse)) {
       if (clientAbortController.signal.aborted) break;
@@ -223,29 +254,27 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
         continue;
       }
       const delta = payload.choices?.[0]?.delta;
-      if (!delta) continue;
+      if (!delta || !delta.content) continue;
 
-      if (delta.content) {
-        let contentChunk = delta.content;
-        while (contentChunk.length > 0) {
-          if (!inThinkTag) {
-            const thinkStartIdx = contentChunk.indexOf("");
-            if (thinkStartIdx !== -1) {
-              rawContentText += contentChunk.slice(0, thinkStartIdx);
-              inThinkTag = true;
-              contentChunk = contentChunk.slice(thinkStartIdx + 7);
-            } else {
-              rawContentText += contentChunk;
-              contentChunk = "";
-            }
+      let contentChunk = delta.content;
+      while (contentChunk.length > 0) {
+        if (!inThinkTag) {
+          const thinkStartIdx = contentChunk.indexOf(tagOpen);
+          if (thinkStartIdx !== -1) {
+            rawContentText += contentChunk.slice(0, thinkStartIdx);
+            inThinkTag = true;
+            contentChunk = contentChunk.slice(thinkStartIdx + tagOpen.length);
           } else {
-            const thinkEndIdx = contentChunk.indexOf("<think>");
-            if (thinkEndIdx !== -1) {
-              inThinkTag = false;
-              contentChunk = contentChunk.slice(thinkEndIdx + 8);
-            } else {
-              contentChunk = "";
-            }
+            rawContentText += contentChunk;
+            contentChunk = "";
+          }
+        } else {
+          const thinkEndIdx = contentChunk.indexOf(tagClose);
+          if (thinkEndIdx !== -1) {
+            inThinkTag = false;
+            contentChunk = contentChunk.slice(thinkEndIdx + tagClose.length);
+          } else {
+            contentChunk = "";
           }
         }
       }
@@ -362,7 +391,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
 }
 
 // ==========================================
-// 5. URL 穿透与上游网络底层 (原样保留 old 的生产级底座)
+// 4. URL 解析与上游网络底层 (原汁原味继承自 old)
 // ==========================================
 function parseTargetFromPath(req) {
   let raw = req.originalUrl.startsWith("/") ? req.originalUrl.slice(1) : req.originalUrl;
@@ -463,7 +492,6 @@ function buildUpstreamHeaders(req) {
   return headers;
 }
 
-// 透传专用函数：用于 /v1/models 与其他非 messages 流量
 async function passthroughRequest(req, res, requestId, targetUrl) {
   const hasBody = !["GET", "HEAD"].includes(req.method);
   const upstream = await fetchUpstreamWithRetry(requestId, targetUrl, {
@@ -619,11 +647,12 @@ function sleep(ms) {
 }
 
 // ==========================================
-// 6. 服务监听启动
+// 5. 服务启动
 // ==========================================
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n\x1b[32m======================================================\x1b[0m`);
-  console.log(` \x1b[36m🚀 CC 智能中介已稳定就绪 (端口: ${PORT})\x1b[0m`);
+  console.log(` \x1b[36m🚀 CC 流水线智能中介已稳定就绪 (端口: ${PORT})\x1b[0m`);
+  console.log(` \x1b[33m🔗 目标代理规范: http://127.0.0.1:${PORT}/https://api.openai.com\x1b[0m`);
   console.log(` \x1b[32m======================================================\x1b[0m\n`);
 });
 
