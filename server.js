@@ -1,86 +1,1214 @@
 /* ==========================================================================
- *  server.js —— 【网络底座与协议中继层】
+ *  server.js —— 【通讯骨架层】
  * ========================================================================== */
 
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import crypto from 'node:crypto';
-import dns from 'node:dns/promises';
-import { Agent, setGlobalDispatcher } from 'undici';
-import * as adapt from './adapt.js';
+import express from "express";
+import crypto from "node:crypto";
+import dns from "node:dns/promises";
+import net from "node:net";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-dotenv.config();
+// 1. 引入 undici 的 Agent 配置
+import { Agent, setGlobalDispatcher } from "undici";
 
-// 1. 网络底座：undici 40分钟超长超时防断开
-dns.setDefaultResultOrder('ipv4first');
+// 2. 调大 Node.js 底层的全局 fetch 超时时间（例如设为 40 分钟 / 2400000ms）
 setGlobalDispatcher(
   new Agent({
-    headersTimeout: 2400000,
-    bodyTimeout: 2400000,
-    connectTimeout: 120000
+    headersTimeout: 2400000, // 响应头超时（设为 40 分钟）
+    bodyTimeout: 2400000,    // Body 传输超时
+    connectTimeout: 120000    // 建连超时
   })
 );
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '100mb' }));
+import * as adapt from "./adapt.js";
+
+dns.setDefaultResultOrder("ipv4first");
+
+/* -------------------------------------------------------------------------- */
+/*                                  Constants                                 */
+/* -------------------------------------------------------------------------- */
 
 const PORT = Number(process.env.PORT || 7860);
-const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
+const CONFIG_FILE = process.env.CONFIG_FILE || "/tmp/tool-bridge-config.json";
 
-function getTimestamp() {
-  return new Date().toISOString().replace('T', ' ').substring(0, 19);
-}
+// 新增：Web 控制台开关，默认关闭 (设置为 "true" 时才开启)
+const ENABLE_DASHBOARD = process.env.ENABLE_DASHBOARD === "true";
 
-const logger = {
-  debug: (stage, details = {}) => {
-    if (!IS_DEBUG) return;
-    console.log(`\n\x1b[36m[${getTimestamp()}]\x1b[0m \x1b[32m【流程: ${stage}】\x1b[0m`);
-    for (const [k, v] of Object.entries(details)) {
-      if (v !== undefined && v !== null) {
-        const valStr = typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v);
-        console.log(`  \x1b[33m▶ ${k}:\x1b[0m ${valStr}`);
-      }
-    }
-  },
-  error: (stage, err) => {
-    console.error(`\n\x1b[31m[${getTimestamp()}] 【错误: ${stage}】\x1b[0m`, err);
-  }
+const MAX_LOG_ENTRIES = 200;
+const MAX_LOG_RAW_CHARS = 20000;
+
+const ALLOW_HTTP = false;
+const ALLOWED_HOSTS = [];
+
+const UPSTREAM_MAX_ATTEMPTS = 2;
+const UPSTREAM_TIMEOUT_MS = 1200000;
+const RETRY_MAX_DELAY_MS = 30000;
+const CONNECT_MAX_ATTEMPTS = 3;
+
+// 记忆每个上游 Host 支持的协议类型: "anthropic" | "openai"
+const endpointProtocolCache = new Map();
+
+const DUMMY_THINKING_SIGNATURE =
+  "ZXhhbXBsZV9zaWduYXR1cmVfZHVtbXlfc3RyaW5nX2Zvcl90aGlua2luZ19ibG9ja192YWxpZGF0aW9u";
+
+const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+
+const DEFAULT_CONFIG = {
+  includeOriginalSystem: false,
+  promptId: adapt.DEFAULT_PROMPT_ID,
+  toolPrompt: "",
+  modelMap: {},
+  tuning: { ...adapt.DEFAULT_TUNING },
+  upstreamMinIntervalMs: 1500,
+  logLevel: "debug",
+  logBodies: true
 };
 
-function parseTargetUrl(req) {
-  let raw = req.originalUrl.startsWith('/') ? req.originalUrl.slice(1) : req.originalUrl;
-  if (!/^https?:\/\//i.test(raw)) {
-    try { raw = decodeURIComponent(raw); } catch {}
+/* -------------------------------------------------------------------------- */
+/*                                  Log Bus                                   */
+/* -------------------------------------------------------------------------- */
+
+class LogBus {
+  constructor(maxEntries) {
+    this.maxEntries = maxEntries;
+    this.entries = [];
+    this.clients = new Set();
+    this.seq = 0;
   }
 
-  const v1Match = raw.match(/^(https?:\/\/[^\/]+(?:\/[^\/]+)*?)\/(v1\/(?:messages|chat\/completions|models|messages\/count_tokens))(?:\?(.*))?$/i);
-  if (v1Match) {
-    return {
-      upstreamBase: v1Match[1],
-      endpoint: '/' + v1Match[2],
-      fullTarget: v1Match[1] + '/' + v1Match[2]
+  get level() {
+    return LOG_LEVELS[runtimeConfig?.logLevel] ?? LOG_LEVELS.debug;
+  }
+
+  emit(requestId, level, event, data) {
+    if ((LOG_LEVELS[level] ?? LOG_LEVELS.info) < this.level) return;
+
+    const entry = {
+      id: crypto.randomUUID(),
+      seq: ++this.seq,
+      time: new Date().toISOString(),
+      requestId: requestId || "-",
+      level,
+      event,
+      data: capPayload(data)
     };
+
+    this.entries.push(entry);
+    while (this.entries.length > this.maxEntries) this.entries.shift();
+
+    const wire = `event: log\ndata: ${JSON.stringify(entry)}\n\n`;
+
+    for (const client of this.clients) {
+      try {
+        client.write(wire);
+      } catch {
+        this.clients.delete(client);
+      }
+    }
+
+    if (level === "error" || level === "warn") {
+      console.log(`[${level}] ${event} ${JSON.stringify(entry.data).slice(0, 400)}`);
+    }
   }
 
-  return {
-    upstreamBase: (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, ''),
-    endpoint: req.path,
-    fullTarget: (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, '') + req.path
+  scoped(requestId) {
+    return (level, event, data) => this.emit(requestId, level, event, data);
+  }
+}
+
+function capPayload(data) {
+  if (data === null || data === undefined) return data;
+  if (typeof data === "string") return capString(data);
+  if (Array.isArray(data)) return data.map(capPayload);
+
+  if (typeof data === "object") {
+    const out = {};
+    for (const [key, value] of Object.entries(data)) {
+      out[key] = typeof value === "string" ? capString(value) : capPayload(value);
+    }
+    return out;
+  }
+
+  return data;
+}
+
+function capString(text) {
+  return text.length > MAX_LOG_RAW_CHARS
+    ? `${text.slice(0, MAX_LOG_RAW_CHARS)}\n…[日志截断，原长 ${text.length} 字符]`
+    : text;
+}
+
+const logBus = new LogBus(MAX_LOG_ENTRIES);
+let runtimeConfig = loadConfig();
+
+/* -------------------------------------------------------------------------- */
+/*                                 Middleware                                 */
+/* -------------------------------------------------------------------------- */
+
+const app = express();
+
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    [
+      "Authorization",
+      "Content-Type",
+      "x-api-key",
+      "anthropic-version",
+      "anthropic-auth-token",
+      "x-tool-bridge-auth-mode"
+    ].join(", ")
+  );
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+app.use(express.json({ limit: "50mb" }));
+
+app.use((error, req, res, next) => {
+  if (error instanceof SyntaxError && error.status === 400 && "body" in error) {
+    return res.status(400).json({
+      error: { type: "invalid_request_error", message: "Invalid JSON request body." }
+    });
+  }
+  next(error);
+});
+
+/* -------------------------------------------------------------------------- */
+/*                               Dashboard APIs                               */
+/* -------------------------------------------------------------------------- */
+
+app.get("/healthz", (req, res) => {
+  res.json({
+    ok: true,
+    service: "claude-code-tool-bridge",
+    dashboardEnabled: ENABLE_DASHBOARD,
+    allowedHostsConfigured: ALLOWED_HOSTS.length > 0
+  });
+});
+
+if (ENABLE_DASHBOARD) {
+  console.log("[tool-bridge] 💡 Web 控制台已开启");
+
+  app.get("/api/config", (req, res) => {
+    res.json({
+      ...runtimeConfig,
+      effectiveToolPrompt: currentPromptText()
+    });
+  });
+
+  app.put("/api/config", (req, res) => {
+    try {
+      runtimeConfig = sanitizeConfig(req.body);
+      saveConfig(runtimeConfig);
+      res.json({ ok: true, config: runtimeConfig });
+    } catch (error) {
+      res.status(400).json({ error: error?.message || "Invalid configuration." });
+    }
+  });
+
+  app.get("/api/presets", (req, res) => {
+    res.json({
+      presets: adapt.PROMPT_PRESETS.map(({ id, label, hint, text }) => ({
+        id, label, hint, text
+      })),
+      protocolRules: adapt.PROTOCOL_RULES,
+      defaultTuning: adapt.DEFAULT_TUNING,
+      logLevels: Object.keys(LOG_LEVELS)
+    });
+  });
+
+  app.get("/api/logs", (req, res) => {
+    setupSSE(res);
+    for (const entry of logBus.entries) {
+      res.write(`event: log\ndata: ${JSON.stringify(entry)}\n\n`);
+    }
+    logBus.clients.add(res);
+    req.on("close", () => logBus.clients.delete(res));
+  });
+
+  app.delete("/api/logs", (req, res) => {
+    logBus.entries = [];
+    res.json({ ok: true });
+  });
+
+  app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), "public")));
+} else {
+  console.log("[tool-bridge] 🔒 Web 控制台已完全关闭 (未设置 ENABLE_DASHBOARD=true)");
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Main Proxy Router                             */
+/* -------------------------------------------------------------------------- */
+
+app.use(async (req, res) => {
+  const requestId = crypto.randomUUID().slice(0, 8);
+
+  try {
+    const targetUrl = parseTargetFromPath(req);
+
+    if (!targetUrl) {
+      return res.status(404).json({
+        error: {
+          type: "invalid_request_error",
+          message:
+            "Expected target URL path, e.g. /https://target.example.com/v1/messages"
+        }
+      });
+    }
+
+    await validateTargetUrl(targetUrl, req);
+
+    const pathname = targetUrl.pathname.replace(/\/+$/, "") || "/";
+
+    if (req.method === "GET" && pathname.endsWith("/v1/models")) {
+      return await passthroughRequest(req, res, requestId, targetUrl);
+    }
+
+    if (req.method === "POST" && pathname.endsWith("/v1/messages/count_tokens")) {
+      return res.json({ input_tokens: estimateTokens(req.body) });
+    }
+
+    if (req.method === "POST" && (pathname.endsWith("/v1/messages") || pathname.endsWith("/v1/message"))) {
+      return await handleAnthropicMessages(req, res, requestId, targetUrl);
+    }
+
+    if (req.method === "POST" && pathname.endsWith("/v1/chat/completions")) {
+      return await handleOpenAIChat(req, res, requestId, targetUrl);
+    }
+
+    return await passthroughRequest(req, res, requestId, targetUrl);
+  } catch (error) {
+    const status = Number(error?.status) || 502;
+
+    logBus.emit(requestId, "error", "request.failed", {
+      status,
+      message: error?.message,
+      stack: error?.stack
+    });
+
+    if (res.headersSent) {
+      try {
+        res.write(
+          `event: error\ndata: ${JSON.stringify({
+            type: "error",
+            error: { type: errorTypeForStatus(status), message: error?.message }
+          })}\n\n`
+        );
+        res.end();
+      } catch {
+        /* Connection closed */
+      }
+      return;
+    }
+
+    return res.status(status).json({
+      error: {
+        type: errorTypeForStatus(status),
+        message: error?.message || "Bridge request failed."
+      }
+    });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                         Anthropic Messages Handler                         */
+/* -------------------------------------------------------------------------- */
+
+async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
+  const messages = [];
+  if (runtimeConfig.includeOriginalSystem && compressed.system) {
+    messages.push({ role: "system", content: compressed.system });
+  }
+  if (toolPrompt) messages.push({ role: "system", content: toolPrompt });
+  messages.push(...renderedMessages);
+
+  // 【核心修复】：严防 adapt 注入过激停用词（如反引号、换行等误杀工具块）
+  // 仅当下游显式传了 stop_sequences 时才透传，不给模型额外加枷锁
+  const safeStop = orUndefined(
+    Array.isArray(body.stop_sequences) && body.stop_sequences.length
+      ? body.stop_sequences
+      : undefined
+  );
+
+  const openAIBody = cleanUndefined({
+    model: resolveModel(body.model),
+    messages,
+    temperature: body.temperature,
+    top_p: body.top_p,
+    stop: safeStop,
+    max_tokens: Math.max(Number(body.max_tokens) || 0, 8192), // 确保思考后仍有充足 token 吐工具
+    stream: true
+  });
+
+  // 强制转为 OpenAI completions 接口
+  const upstreamUrl = rewriteAnthropicMessagesToOpenAI(originalTargetUrl);
+
+  log("info", "upstream.attempt", { mode: "direct_openai_stream", url: String(upstreamUrl) });
+
+  const upstreamResponse = await fetchUpstreamStreamWithRetry(
+    requestId,
+    upstreamUrl,
+    {
+      method: "POST",
+      headers: {
+        ...buildUpstreamHeaders(req),
+        "Content-Type": "application/json",
+        Accept: "text/event-stream, application/json"
+      },
+      body: JSON.stringify(openAIBody),
+      signal: clientAbortController.signal
+    }
+  );
+
+  // 2. 实时流式解析 OpenAI 上游并转发思考流
+  let rawContentText = "";
+  let reasoningText = "";
+  const nativeToolCallMap = new Map();
+  let inThinkTag = false;
+  let upstreamFinishReason = null;
+
+  for await (const { data } of readSSE(upstreamResponse)) {
+    if (clientAbortController.signal.aborted) return;
+    if (!data) continue;
+    if (data === "[DONE]") break;
+
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    const choice = payload.choices?.[0];
+    if (choice?.finish_reason) upstreamFinishReason = choice.finish_reason;
+    const delta = choice?.delta;
+    if (!delta) continue;
+
+    // A. 提取原生 reasoning_content (DeepSeek API / vLLM / NewAPI 字段)
+    const thinkingChunk = delta.reasoning_content || delta.reasoning || delta.thinking_content || "";
+    if (thinkingChunk) {
+      reasoningText += thinkingChunk;
+      if (streamBridge) streamBridge.emitThinkingDelta(thinkingChunk, estimateTokens(body));
+    }
+
+    // B. 处理正文 delta.content，同时兼顾模型自行输出的<think>标签
+    if (delta.content) {
+      let contentChunk = delta.content;
+
+      while (contentChunk.length > 0) {
+        if (!inThinkTag) {
+          const thinkStartIdx = contentChunk.indexOf("");
+          if (thinkStartIdx !== -1) {
+            const beforePiece = contentChunk.slice(0, thinkStartIdx);
+            rawContentText += beforePiece;
+
+            inThinkTag = true;
+            contentChunk = contentChunk.slice(thinkStartIdx + 7);
+          } else {
+            rawContentText += contentChunk;
+            contentChunk = "";
+          }
+        } else {
+          const thinkEndIdx = contentChunk.indexOf("<think>");
+          if (thinkEndIdx !== -1) {
+            const thinkPiece = contentChunk.slice(0, thinkEndIdx);
+            reasoningText += thinkPiece;
+            if (streamBridge && thinkPiece) {
+              streamBridge.emitThinkingDelta(thinkPiece, estimateTokens(body));
+            }
+            inThinkTag = false;
+            contentChunk = contentChunk.slice(thinkEndIdx + 8);
+          } else {
+            reasoningText += contentChunk;
+            if (streamBridge) {
+              streamBridge.emitThinkingDelta(contentChunk, estimateTokens(body));
+            }
+            contentChunk = "";
+          }
+        }
+      }
+    }
+
+    // C. 收集原生工具调用
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        if (!nativeToolCallMap.has(idx)) {
+          nativeToolCallMap.set(idx, {
+            id: tc.id || "",
+            name: tc.function?.name || "",
+            arguments: tc.function?.arguments || ""
+          });
+        } else {
+          const item = nativeToolCallMap.get(idx);
+          if (tc.id) item.id = tc.id;
+          if (tc.function?.name) item.name += tc.function.name;
+          if (tc.function?.arguments) item.arguments += tc.function.arguments;
+        }
+      }
+    }
+  }
+
+  if (clientAbortController.signal.aborted) return;
+
+  // 思考部分传输完毕，向下游关闭 thinking block
+  if (streamBridge) streamBridge.finishThinking();
+
+  // 3. 正文兜底容错与工具提取
+  const { text: cleanText } = adapt.splitThinking(rawContentText);
+  let sanitizedText = cleanText;
+  if (sanitizedText.includes("tool_call>") && !sanitizedText.includes("<tool_call>")) {
+    sanitizedText = sanitizedText.replace(/(?<!<)tool_call>/g, "<tool_call>");
+  }
+
+  const extracted = adapt.extractToolCalls(sanitizedText, tools, tuning, log, () =>
+    `toolu_${uuid()}`
+  );
+
+  const nativeToolCalls = Array.from(nativeToolCallMap.values()).map((c) => ({
+    id: c.id,
+    function: { name: c.name, arguments: c.arguments }
+  }));
+
+  const nativeExtracted = extractNativeOpenAIToolCalls(
+    { tool_calls: nativeToolCalls },
+    tools,
+    tuning
+  );
+
+  let mergedCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
+  let cleanContent = extracted.content;
+
+  // 兜底识别上游模型直接在文本中输出的 JSON / Python 字典 / 裸参数工具调用
+  const textToSearch = sanitizedText || cleanContent;
+
+  if (mergedCalls.length === 0 && textToSearch) {
+    // 1. 安全解析标准 JSON 或 Python 字典（支持单双引号、True/False/None 及未闭合容错）
+    const parseLooseJsonOrPython = (str) => {
+      // 优先尝试原生 JSON.parse
+      try {
+        return { value: JSON.parse(str), endIndex: str.length };
+      } catch {}
+
+      let i = 0;
+      const len = str.length;
+      const skipWs = () => { while (i < len && /\s/.test(str[i])) i++; };
+
+      const parseVal = () => {
+        skipWs();
+        if (i >= len) return null;
+        const ch = str[i];
+        if (ch === "{") return parseObj();
+        if (ch === "[") return parseArr();
+        if (ch === '"' || ch === "'") return parseStr();
+        if (ch === "-" || (ch >= "0" && ch <= "9")) return parseNum();
+
+        const match = str.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+        if (match) {
+          const ident = match[0];
+          i += ident.length;
+          if (ident === "True" || ident === "true") return true;
+          if (ident === "False" || ident === "false") return false;
+          if (ident === "None" || ident === "null") return null;
+          return ident;
+        }
+        throw new Error(`Unexpected character: ${ch}`);
+      };
+
+      const parseStr = () => {
+        const quote = str[i++];
+        let res = "";
+        while (i < len) {
+          const ch = str[i++];
+          if (ch === quote) return res;
+          if (ch === "\\") {
+            if (i >= len) break;
+            const esc = str[i++];
+            if (esc === "n") res += "\n";
+            else if (esc === "r") res += "\r";
+            else if (esc === "t") res += "\t";
+            else if (esc === "b") res += "\b";
+            else if (esc === "f") res += "\f";
+            else if (esc === quote) res += quote;
+            else if (esc === "\\") res += "\\";
+            else if (esc === "u") {
+              const hex = str.slice(i, i + 4);
+              if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+                res += String.fromCharCode(parseInt(hex, 16));
+                i += 4;
+              } else {
+                res += "\\u";
+              }
+            } else {
+              res += esc;
+            }
+          } else {
+            res += ch;
+          }
+        }
+        return res;
+      };
+
+      const parseNum = () => {
+        const start = i;
+        if (str[i] === "-") i++;
+        while (i < len && str[i] >= "0" && str[i] <= "9") i++;
+        if (i < len && str[i] === ".") {
+          i++;
+          while (i < len && str[i] >= "0" && str[i] <= "9") i++;
+        }
+        if (i < len && (str[i] === "e" || str[i] === "E")) {
+          i++;
+          if (i < len && (str[i] === "+" || str[i] === "-")) i++;
+          while (i < len && str[i] >= "0" && str[i] <= "9") i++;
+        }
+        return Number(str.slice(start, i));
+      };
+
+      const parseObj = () => {
+        i++; // skip '{'
+        const obj = {};
+        skipWs();
+        if (i < len && str[i] === "}") { i++; return obj; }
+        while (i < len) {
+          skipWs();
+          if (i >= len || str[i] === "}") break;
+          let key = "";
+          if (str[i] === '"' || str[i] === "'") {
+            key = parseStr();
+          } else {
+            const km = str.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+            if (!km) break;
+            key = km[0];
+            i += key.length;
+          }
+          skipWs();
+          if (i >= len || str[i] !== ":") break;
+          i++;
+          obj[key] = parseVal();
+          skipWs();
+          if (i < len && str[i] === ",") {
+            i++;
+            skipWs();
+            if (i < len && str[i] === "}") { i++; return obj; }
+          } else if (i < len && str[i] === "}") {
+            i++;
+            return obj;
+          } else if (i >= len) {
+            return obj;
+          } else {
+            break;
+          }
+        }
+        if (i < len && str[i] === "}") i++;
+        return obj;
+      };
+
+      const parseArr = () => {
+        i++; // skip '['
+        const arr = [];
+        skipWs();
+        if (i < len && str[i] === "]") { i++; return arr; }
+        while (i < len) {
+          arr.push(parseVal());
+          skipWs();
+          if (i < len && str[i] === ",") {
+            i++;
+            skipWs();
+            if (i < len && str[i] === "]") { i++; return arr; }
+          } else if (i < len && str[i] === "]") {
+            i++;
+            return arr; // 【修复原代码致命 Bug: 原为 return obj 抛错】
+          } else if (i >= len) {
+            return arr;
+          } else {
+            break;
+          }
+        }
+        if (i < len && str[i] === "]") i++;
+        return arr;
+      };
+
+      skipWs();
+      const value = parseVal();
+      return { value, endIndex: i };
+    };
+
+    // 2. 提取并平衡括号对象的切片
+    const extractBalancedObjectString = (text, startIdx) => {
+      let depth = 0;
+      let inString = false;
+      let quoteChar = "";
+      let escape = false;
+
+      for (let pos = startIdx; pos < text.length; pos++) {
+        const ch = text[pos];
+
+        if (inString) {
+          if (escape) {
+            escape = false;
+          } else if (ch === "\\") {
+            escape = true;
+          } else if (ch === quoteChar) {
+            inString = false;
+          }
+          continue;
+        }
+
+        if (ch === '"' || ch === "'") {
+          inString = true;
+          quoteChar = ch;
+        } else if (ch === "{") {
+          depth++;
+        } else if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            return text.slice(startIdx, pos + 1);
+          }
+        }
+      }
+      return text.slice(startIdx); // 未完全闭合时截取至 EOF
+    };
+
+    // 3. 收集所有可能的工具调用起始点（优先正则锚定显式结构，杜绝被大段代码干扰）
+    const explicitPattern = /\{\s*["'](?:name|type|function|tool|action)["']\s*:/g;
+    const candidateIndices = [];
+    let match;
+    while ((match = explicitPattern.exec(textToSearch)) !== null) {
+      candidateIndices.push(match.index);
+    }
+
+    // 若未通过正则找到显式键，再兜底扫描开头的每一个 '{'
+    if (candidateIndices.length === 0) {
+      for (let pos = 0; pos < textToSearch.length; pos++) {
+        if (textToSearch[pos] === "{") candidateIndices.push(pos);
+      }
+    }
+
+    let recoveredCall = null;
+    let recoveredStartIndex = -1;
+
+    // 4. 解析与识别
+    for (const startPos of candidateIndices) {
+      const candidateStr = extractBalancedObjectString(textToSearch, startPos);
+      let parsed = null;
+
+      try {
+        parsed = JSON.parse(candidateStr);
+      } catch {
+        try {
+          const res = parseLooseJsonOrPython(candidateStr);
+          parsed = res?.value;
+        } catch {}
+      }
+
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+
+      let callName = null;
+      let callArgs = null;
+      const callId = parsed.id || null;
+
+      // 模式 1: Anthropic 格式 {"type":"tool_use","name":"Write","input":{...}}
+      if (parsed.type === "tool_use" || (parsed.name && parsed.input !== undefined)) {
+        callName = parsed.name;
+        callArgs = parsed.input;
+      }
+      // 模式 2: OpenAI / Python 格式 {"name":"Write","arguments":{...}}
+      else if (parsed.name && (parsed.arguments !== undefined || parsed.parameters !== undefined)) {
+        callName = parsed.name;
+        callArgs = parsed.arguments !== undefined ? parsed.arguments : parsed.parameters;
+      }
+      // 模式 3: 包含 name 字段且 name 对应某个工具
+      else if (parsed.name) {
+        const resolved = adapt.resolveToolName?.(parsed.name, tools) || parsed.name;
+        const matchedTool = adapt.getToolByName?.(resolved, tools) ||
+          tools.find((t) => t.name.toLowerCase() === String(parsed.name).toLowerCase());
+        if (matchedTool) {
+          callName = matchedTool.name;
+          const { name: _n, id: _id, type: _t, ...rest } = parsed;
+          callArgs = rest;
+        }
+      }
+
+      // 如果 arguments 是序列化的 JSON 字符串，反序列化
+      if (typeof callArgs === "string") {
+        try {
+          callArgs = JSON.parse(callArgs);
+        } catch {
+          try {
+            callArgs = parseLooseJsonOrPython(callArgs).value;
+          } catch {}
+        }
+      }
+
+      // 规范化工具名
+      if (callName) {
+        const resolved = adapt.resolveToolName?.(callName, tools) || callName;
+        const matchedTool = adapt.getToolByName?.(resolved, tools) ||
+          tools.find((t) => t.name.toLowerCase() === String(callName).toLowerCase());
+        if (matchedTool) callName = matchedTool.name;
+      }
+
+      if (callName && callArgs && typeof callArgs === "object" && !Array.isArray(callArgs)) {
+        recoveredCall = {
+          id: callId || `toolu_${uuid()}`,
+          name: callName,
+          arguments: adapt.sanitizeToolArguments ? adapt.sanitizeToolArguments(callArgs) : callArgs
+        };
+        recoveredStartIndex = startPos;
+        break;
+      }
+    }
+
+    // 5. 兜底未声明 tool name 的纯参数对象推断 (如只输出了 {"file_path": "...", "content": "..."})
+    if (!recoveredCall) {
+      for (const startPos of candidateIndices) {
+        const candidateStr = extractBalancedObjectString(textToSearch, startPos);
+        let parsed = null;
+        try {
+          parsed = JSON.parse(candidateStr);
+        } catch {
+          try { parsed = parseLooseJsonOrPython(candidateStr)?.value; } catch {}
+        }
+
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+
+        let inferredToolName = null;
+        const paramKeys = Object.keys(parsed);
+
+        if (parsed.command) {
+          inferredToolName = "Bash";
+        } else if (parsed.file_path && parsed.content !== undefined) {
+          inferredToolName = "Write";
+        } else {
+          for (const tool of tools) {
+            const properties = Object.keys(tool.parameters?.properties || {});
+            if (properties.length > 0 && paramKeys.some((k) => properties.includes(k))) {
+              inferredToolName = tool.name;
+              break;
+            }
+          }
+        }
+
+        if (inferredToolName) {
+          recoveredCall = {
+            id: `toolu_${uuid()}`,
+            name: inferredToolName,
+            arguments: adapt.sanitizeToolArguments ? adapt.sanitizeToolArguments(parsed) : parsed
+          };
+          recoveredStartIndex = startPos;
+          break;
+        }
+      }
+    }
+
+    if (recoveredCall) {
+      mergedCalls = [recoveredCall];
+      cleanContent = textToSearch.slice(0, recoveredStartIndex).replace(/```[a-zA-Z0-9_-]*\s*$/, "").trim();
+      log("info", "tool_call.recovered_from_text", {
+        toolName: recoveredCall.name,
+        arguments: recoveredCall.arguments
+      });
+    } else if (sanitizedText && sanitizedText.length > cleanContent.length) {
+      cleanContent = sanitizedText;
+    }
+  }
+
+  const toolCalls = mergedCalls;
+  const text = ensureVisibleAssistantText(
+    cleanContent,
+    toolCalls,
+    "上游模型返回了空内容，未生成可执行的工具调用。"
+  );
+
+  log("info", "response.out", {
+    finishReason: upstreamFinishReason,
+    toolCalls: toolCalls.map((call) => ({
+      name: call.name,
+      args: Object.keys(call.arguments || {})
+    })),
+    textLength: text.length,
+    thinkingLength: reasoningText.length,
+    rejectedCandidates: extracted.rejected.length
+  });
+
+  // 4. 响应给下游
+  if (streamBridge) {
+    return streamBridge.finishWithPayload({
+      text,
+      toolCalls,
+      inputTokens: estimateTokens(body),
+      outputTokens: estimateTokens(rawContentText + reasoningText)
+    });
+  }
+
+  const response = buildAnthropicResponse({
+    requestModel: body.model,
+    text,
+    reasoningText,
+    toolCalls,
+    inputTokens: estimateTokens(body),
+    outputTokens: estimateTokens(rawContentText + reasoningText)
+  });
+  return res.json(response);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                       OpenAI Chat Completions Handler                      */
+/* -------------------------------------------------------------------------- */
+
+async function handleOpenAIChat(req, res, requestId, targetUrl) {
+  const log = logBus.scoped(requestId);
+  const body = req.body || {};
+  const tuning = runtimeConfig.tuning;
+  const tools = normalizeOpenAITools(body);
+
+  log("info", "request.in", {
+    entry: "openai",
+    model: body.model,
+    mappedModel: resolveModel(body.model),
+    stream: body.stream === true,
+    messageCount: (body.messages || []).length,
+    toolCount: tools.length,
+    toolNames: tools.map((tool) => tool.name),
+    toolChoice: body.tool_choice
+  });
+
+  const conversation = openaiToConversation(body, tools, tuning, log);
+  const compressed = adapt.compressHistory(conversation, tuning, log);
+  const messages = [];
+
+  if (runtimeConfig.includeOriginalSystem && compressed.system) {
+    messages.push({ role: "system", content: compressed.system });
+  }
+
+  const toolPrompt = adapt.renderToolPrompt(tools, body.tool_choice, {
+    promptText: currentPromptText(),
+    tuning
+  });
+
+  if (toolPrompt) messages.push({ role: "system", content: toolPrompt });
+  messages.push(...adapt.renderConversation(compressed, tuning, log));
+
+  const repeatWarning = adapt.detectRepeatedToolCall(compressed, tuning);
+  if (repeatWarning) {
+    log("warn", "loop.repeat_detected", { injected: repeatWarning });
+    messages.push({ role: "user", content: repeatWarning });
+  }
+
+  // 【改动处 3】：这里同样由 stream: false 改为流式请求
+  const upstreamBody = cleanUndefined({
+    model: resolveModel(body.model),
+    messages,
+    temperature: body.temperature,
+    top_p: body.top_p,
+    stop: orUndefined(adapt.buildStopSequences(body.stop, tools, tuning)),
+    seed: body.seed,
+    response_format: body.response_format,
+    stream: true // 开启流式
+  });
+
+  const isClientStream = body.stream === true;
+  const streamBridge = isClientStream ? new OpenAIStreamBridge(res, body.model) : null;
+
+  const onThinkingDelta = (chunk) => {
+    if (streamBridge) streamBridge.emitReasoningDelta(chunk);
   };
+
+  const upstreamResponse = await fetchUpstreamStreamWithRetry(requestId, targetUrl, {
+    method: "POST",
+    headers: {
+      ...buildUpstreamHeaders(req),
+      "Content-Type": "application/json",
+      Accept: "text/event-stream, application/json"
+    },
+    body: JSON.stringify(upstreamBody)
+  });
+
+  const { rawText, reasoningText, nativeToolCalls } = await consumeOpenAIStream(
+    upstreamResponse,
+    onThinkingDelta
+  );
+
+  const { text: cleanText, thinking } = adapt.splitThinking(rawText);
+  const finalReasoning = reasoningText || thinking || "";
+
+  const extracted = adapt.extractToolCalls(cleanText, tools, tuning, log, () =>
+    `toolu_${uuid()}`
+  );
+
+  const nativeExtracted = extractNativeOpenAIToolCalls(
+    { tool_calls: nativeToolCalls },
+    tools,
+    tuning
+  );
+
+  const toolCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
+
+  const text = ensureVisibleAssistantText(
+    extracted.content,
+    toolCalls,
+    "上游模型返回了空内容，未生成可执行的工具调用。"
+  );
+
+  log("info", "response.out", {
+    toolCalls: toolCalls.map((call) => call.name),
+    textLength: text.length,
+    rejectedCandidates: extracted.rejected.length
+  });
+
+  if (streamBridge) {
+    return streamBridge.finishWithPayload({ text, toolCalls });
+  }
+
+  const response = buildOpenAIResponse({
+    model: body.model,
+    text,
+    reasoningText: finalReasoning,
+    toolCalls
+  });
+
+  return res.json(response);
 }
 
-function estimateTokens(value) {
-  const text = typeof value === 'string' ? value : JSON.stringify(value || {});
-  return Math.max(1, Math.ceil(text.length / 4));
+/* -------------------------------------------------------------------------- */
+/*             流式流转桥接器 (Thinking 实时流 / 正文整流缓存)                 */
+/* -------------------------------------------------------------------------- */
+
+class AnthropicStreamBridge {
+  constructor(res, requestModel, requestId, log) {
+    this.res = res;
+    this.requestModel = requestModel || "claude-sonnet-x";
+    this.requestId = requestId;
+    this.log = log;
+    this.msgId = `msg_${uuid()}`;
+    this.started = false;
+    this.thinkingStarted = false;
+    this.thinkingEnded = false;
+    this.currentIndex = 0;
+
+    // 【修复】：连接建立瞬间立刻初始化 SSE 头部，通知网关这是持久流
+    setupSSE(this.res);
+    this.ensureStarted(0);
+
+    this.keepAliveTimer = setInterval(() => {
+      try {
+        if (!this.res.writableEnded) {
+          this.res.write(": keep-alive\n\n");
+        }
+      } catch {
+        clearInterval(this.keepAliveTimer);
+      }
+    }, 15000);
+  }
+
+  // 立即开始思考：收到请求后立刻向下游发送 message_start 和 thinking 块
+  startThinkingEarly(inputTokens = 0) {
+    this.ensureStarted(inputTokens);
+    if (!this.thinkingStarted) {
+      sseSend(this.res, "content_block_start", {
+        type: "content_block_start",
+        index: this.currentIndex,
+        content_block: { type: "thinking", thinking: "" }
+      });
+      this.thinkingStarted = true;
+    }
+  }
+
+  ensureStarted(inputTokens = 0) {
+    if (this.started) return;
+    setupSSE(this.res);
+    sseSend(this.res, "message_start", {
+      type: "message_start",
+      message: {
+        id: this.msgId,
+        type: "message",
+        role: "assistant",
+        model: this.requestModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: 0 }
+      }
+    });
+    this.started = true;
+  }
+
+  emitThinkingDelta(thinkingChunk, inputTokens = 0) {
+    if (!thinkingChunk) return;
+    this.startThinkingEarly(inputTokens);
+
+    sseSend(this.res, "content_block_delta", {
+      type: "content_block_delta",
+      index: this.currentIndex,
+      delta: { type: "thinking_delta", thinking: thinkingChunk }
+    });
+  }
+
+  finishThinking() {
+    if (this.thinkingStarted && !this.thinkingEnded) {
+      sseSend(this.res, "content_block_delta", {
+        type: "content_block_delta",
+        index: this.currentIndex,
+        delta: { type: "signature_delta", signature: DUMMY_THINKING_SIGNATURE }
+      });
+      sseSend(this.res, "content_block_stop", {
+        type: "content_block_stop",
+        index: this.currentIndex
+      });
+      this.thinkingEnded = true;
+      this.currentIndex++;
+    }
+  }
+
+  finishWithPayload({ text, toolCalls, inputTokens, outputTokens }) {
+    if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+
+    this.ensureStarted(inputTokens);
+    this.finishThinking();
+
+    // 1. 发送清洗适配后的正文
+    if (text) {
+      sseSend(this.res, "content_block_start", {
+        type: "content_block_start",
+        index: this.currentIndex,
+        content_block: { type: "text", text: "" }
+      });
+      sseSend(this.res, "content_block_delta", {
+        type: "content_block_delta",
+        index: this.currentIndex,
+        delta: { type: "text_delta", text }
+      });
+      sseSend(this.res, "content_block_stop", {
+        type: "content_block_stop",
+        index: this.currentIndex
+      });
+      this.currentIndex++;
+    }
+
+    // 2. 发送提取出的 Tool Use 块
+    for (const call of toolCalls) {
+      sseSend(this.res, "content_block_start", {
+        type: "content_block_start",
+        index: this.currentIndex,
+        content_block: {
+          type: "tool_use",
+          id: call.id,
+          name: call.name,
+          input: {}
+        }
+      });
+      sseSend(this.res, "content_block_delta", {
+        type: "content_block_delta",
+        index: this.currentIndex,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify(call.arguments || {})
+        }
+      });
+      sseSend(this.res, "content_block_stop", {
+        type: "content_block_stop",
+        index: this.currentIndex
+      });
+      this.currentIndex++;
+    }
+
+    const stopReason = toolCalls.length ? "tool_use" : "end_turn";
+
+    sseSend(this.res, "message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: outputTokens }
+    });
+
+    sseSend(this.res, "message_stop", { type: "message_stop" });
+    this.res.end();
+  }
 }
 
-// SSE 解析生成器
+class OpenAIStreamBridge {
+  constructor(res, model) {
+    this.res = res;
+    this.model = model || "tool-bridge-model";
+    this.id = `chatcmpl_${uuid()}`;
+    this.created = Math.floor(Date.now() / 1000);
+    this.started = false;
+  }
+
+  ensureStarted() {
+    if (this.started) return;
+    setupSSE(this.res);
+    this.sendDelta({ role: "assistant" });
+    this.started = true;
+  }
+
+  sendDelta(delta, finishReason = null) {
+    this.res.write(
+      `data: ${JSON.stringify({
+        id: this.id,
+        object: "chat.completion.chunk",
+        created: this.created,
+        model: this.model,
+        choices: [{ index: 0, delta, finish_reason: finishReason }]
+      })}\n\n`
+    );
+  }
+
+  emitReasoningDelta(reasoningChunk) {
+    if (!reasoningChunk) return;
+    this.ensureStarted();
+    this.sendDelta({ reasoning_content: reasoningChunk });
+  }
+
+  finishWithPayload({ text, toolCalls }) {
+    this.ensureStarted();
+
+    if (text) {
+      this.sendDelta({ content: text });
+    }
+
+    for (let index = 0; index < (toolCalls?.length || 0); index++) {
+      const call = toolCalls[index];
+      this.sendDelta({
+        tool_calls: [
+          {
+            index,
+            id: `call_${call.id}`,
+            type: "function",
+            function: { name: call.name, arguments: "" }
+          }
+        ]
+      });
+      this.sendDelta({
+        tool_calls: [
+          {
+            index,
+            function: { arguments: JSON.stringify(call.arguments || {}) }
+          }
+        ]
+      });
+    }
+
+    this.sendDelta({}, toolCalls?.length ? "tool_calls" : "stop");
+    this.res.write("data: [DONE]\n\n");
+    this.res.end();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        上游流式读取解析器 (SSE Parser)                      */
+/* -------------------------------------------------------------------------- */
+
 async function* readSSE(response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  let buffer = "";
 
   try {
     while (true) {
@@ -88,420 +1216,1241 @@ async function* readSSE(response) {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || '';
+      buffer = lines.pop() || "";
 
+      let eventType = null;
       let dataLines = [];
+
       for (const line of lines) {
-        if (line.startsWith('data:')) {
+        if (line.startsWith("event:")) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
           dataLines.push(line.slice(5).trim());
-        } else if (line === '' && dataLines.length > 0) {
-          yield dataLines.join('\n');
-          dataLines = [];
+        } else if (line === "") {
+          if (dataLines.length > 0) {
+            yield { event: eventType, data: dataLines.join("\n") };
+            eventType = null;
+            dataLines = [];
+          }
         }
       }
     }
-    if (buffer.trim()) yield buffer.replace(/^data:\s*/, '');
+
+    if (buffer.trim()) {
+      const lines = buffer.split(/\r?\n/);
+      let eventType = null;
+      let dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) eventType = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      }
+      if (dataLines.length > 0) {
+        yield { event: eventType, data: dataLines.join("\n") };
+      }
+    }
   } finally {
     reader.releaseLock();
   }
 }
 
-// 上游流式调用（聚合文本与思考）
-async function fetchUpstream(targetBase, apiKey, model, prompt) {
-  const headers = {
-    'Content-Type': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-    'Authorization': `Bearer ${apiKey}`,
-    'x-api-key': apiKey,
-    'anthropic-version': '2023-06-01',
-    'Accept': 'text/event-stream, application/json'
-  };
+async function consumeAnthropicStream(response, onThinkingDelta) {
+  let rawText = "";
+  let reasoningText = "";
 
-  // 1. 尝试 Anthropic /v1/messages
-  try {
-    const res = await fetch(`${targetBase}/v1/messages`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: model || 'claude-3-7-sonnet-20250219',
-        max_tokens: 8192,
-        messages: [{ role: 'user', content: prompt }],
-        stream: true
-      })
-    });
-
-    if (res.ok) {
-      let fullText = '';
-      let thinkingText = '';
-      for await (const chunk of readSSE(res)) {
-        if (!chunk || chunk === '[DONE]') continue;
-        try {
-          const payload = JSON.parse(chunk);
-          if (payload.type === 'content_block_delta') {
-            if (payload.delta?.type === 'thinking_delta' && payload.delta.thinking) {
-              thinkingText += payload.delta.thinking;
-            } else if (payload.delta?.type === 'text_delta' && payload.delta.text) {
-              fullText += payload.delta.text;
-            }
-          }
-        } catch {}
-      }
-      return { text: fullText, thinking: thinkingText };
-    }
-  } catch {}
-
-  // 2. 回退 OpenAI /v1/chat/completions
-  const chatRes = await fetch(`${targetBase}/v1/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: model || 'claude-3-7-sonnet-20250219',
-      messages: [{ role: 'user', content: prompt }],
-      stream: true
-    })
-  });
-
-  if (!chatRes.ok) {
-    const errText = await chatRes.text();
-    throw new Error(`上游接口响应异常: HTTP ${chatRes.status} - ${errText}`);
-  }
-
-  let fullText = '';
-  let thinkingText = '';
-  let inThinkTag = false;
-
-  for await (const chunk of readSSE(chatRes)) {
-    if (!chunk || chunk === '[DONE]') continue;
+  for await (const { data } of readSSE(response)) {
+    if (!data || data === "[DONE]") continue;
+    let payload;
     try {
-      const payload = JSON.parse(chunk);
-      const delta = payload.choices?.[0]?.delta;
-      if (delta) {
-        if (delta.reasoning_content || delta.reasoning) {
-          thinkingText += delta.reasoning_content || delta.reasoning;
-        }
-        if (delta.content) {
-          let piece = delta.content;
-          while (piece.length > 0) {
-            if (!inThinkTag) {
-              const start = piece.indexOf('<think>');
-              if (end !== -1) {
-                thinkingText += piece.slice(0, end);
-                inThinkTag = false;
-                piece = piece.slice(end + 8);
-              } else {
-                thinkingText += piece;
-                piece = '';
-              }
-            }
-          }
-        }
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    if (payload.type === "content_block_delta") {
+      const delta = payload.delta;
+      if (delta?.type === "thinking_delta" && delta.thinking) {
+        reasoningText += delta.thinking;
+        if (onThinkingDelta) onThinkingDelta(delta.thinking);
+      } else if (delta?.type === "text_delta" && delta.text) {
+        rawText += delta.text;
       }
-    } catch {}
+    }
   }
 
-  return { text: fullText, thinking: thinkingText };
+  return { rawText, reasoningText };
 }
 
-// ==========================================
-// 路由定义
-// ==========================================
+async function consumeOpenAIStream(response, onThinkingDelta) {
+  let rawText = "";
+  let reasoningText = "";
+  const nativeToolCallMap = new Map();
 
-// 1. 模型列表
-app.get(/(.*)\/v1\/models$/, async (req, res) => {
-  const { upstreamBase } = parseTargetUrl(req);
-  try {
-    const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
-    const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
-      headers: { 'Authorization': authHeader, 'x-api-key': req.headers['x-api-key'] || '' },
-      signal: AbortSignal.timeout(8000)
+  for await (const { data } of readSSE(response)) {
+    if (!data) continue;
+    if (data === "[DONE]") break;
+
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    const choice = payload.choices?.[0];
+    const delta = choice?.delta;
+    if (!delta) continue;
+
+    // 1. 优先提取标准思考字段 (GLM/DeepSeek 格式)
+    const thinkingChunk = delta.reasoning_content || delta.reasoning || delta.thinking_content || "";
+    if (thinkingChunk) {
+      reasoningText += thinkingChunk;
+      if (onThinkingDelta) onThinkingDelta(thinkingChunk);
+    }
+
+    // 2. 正文字段
+    if (delta.content) {
+      rawText += delta.content;
+    }
+
+    // 3. 原生工具调用字段
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        if (!nativeToolCallMap.has(idx)) {
+          nativeToolCallMap.set(idx, {
+            id: tc.id || "",
+            name: tc.function?.name || "",
+            arguments: tc.function?.arguments || ""
+          });
+        } else {
+          const item = nativeToolCallMap.get(idx);
+          if (tc.id) item.id = tc.id;
+          if (tc.function?.name) item.name += tc.function.name;
+          if (tc.function?.arguments) item.arguments += tc.function.arguments;
+        }
+      }
+    }
+  }
+
+  return {
+    rawText,
+    reasoningText,
+    nativeToolCalls: Array.from(nativeToolCallMap.values()).map((c) => ({
+      id: c.id,
+      function: { name: c.name, arguments: c.arguments }
+    }))
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/*        协议层：客户端报文 → Conversation 中间表示                              */
+/* -------------------------------------------------------------------------- */
+
+function anthropicToConversation(body) {
+  const messages = [];
+
+  for (const message of body.messages || []) {
+    const parts = [];
+    const content = message?.content;
+
+    if (typeof content === "string") {
+      parts.push({ kind: "text", text: adapt.stripClientNoise(content) });
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!block) continue;
+
+        switch (block.type) {
+          case "text":
+            parts.push({ kind: "text", text: adapt.stripClientNoise(block.text || "") });
+            break;
+
+          case "thinking":
+            parts.push({ kind: "thinking", text: block.thinking || "" });
+            break;
+
+          case "redacted_thinking":
+            parts.push({ kind: "thinking", text: "" });
+            break;
+
+          case "tool_use":
+            parts.push({
+              kind: "tool_call",
+              id: block.id,
+              name: block.name,
+              args: block.input || {}
+            });
+            break;
+
+          case "tool_result":
+            parts.push({
+              kind: "tool_result",
+              id: block.tool_use_id || "",
+              text: contentToText(block.content)
+            });
+            break;
+
+          case "image":
+            parts.push({ kind: "image" });
+            break;
+
+          default:
+            parts.push({ kind: "text", text: contentToText(block) });
+        }
+      }
+    } else if (content) {
+      parts.push({ kind: "text", text: adapt.stripClientNoise(contentToText(content)) });
+    }
+
+    const kept = parts.filter((part) => part.kind !== "text" || part.text);
+    if (!kept.length) continue;
+
+    messages.push({
+      role: message.role === "assistant" ? "assistant" : "user",
+      parts: kept
     });
-    if (upstreamRes.ok) return res.json(await upstreamRes.json());
-  } catch {}
+  }
 
-  res.json({
-    object: 'list',
-    data: [
-      { id: 'claude-3-7-sonnet-20250219', object: 'model' },
-      { id: 'claude-3-5-sonnet-20241022', object: 'model' }
-    ]
+  return { system: anthropicSystemToText(body.system), messages };
+}
+
+function openaiToConversation(body, tools, tuning, log) {
+  const systemChunks = [];
+  const messages = [];
+
+  for (const message of body.messages || []) {
+    if (!message) continue;
+
+    if (message.role === "system" || message.role === "developer") {
+      const text = contentToText(message.content).trim();
+      if (text) systemChunks.push(text);
+      continue;
+    }
+
+    const parts = [];
+
+    if (message.role === "tool") {
+      parts.push({
+        kind: "tool_result",
+        id: message.tool_call_id || "",
+        text: contentToText(message.content)
+      });
+    } else {
+      const text = adapt.stripClientNoise(contentToText(message.content));
+
+      if (message.role === "assistant" && text) {
+        const recovered = adapt.extractToolCalls(text, tools, tuning, () => {});
+
+        if (recovered.toolCalls.length) {
+          if (recovered.content) parts.push({ kind: "text", text: recovered.content });
+
+          for (const call of recovered.toolCalls) {
+            parts.push({
+              kind: "tool_call",
+              id: call.id,
+              name: call.name,
+              args: call.arguments
+            });
+          }
+        } else if (text) {
+          parts.push({ kind: "text", text });
+        }
+      } else if (text) {
+        parts.push({ kind: "text", text });
+      }
+
+      if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
+        const native = extractNativeOpenAIToolCalls(
+          { tool_calls: message.tool_calls },
+          tools,
+          tuning
+        );
+
+        for (const call of native) {
+          const duplicate = parts.some(
+            (part) =>
+              part.kind === "tool_call" &&
+              part.name === call.name &&
+              JSON.stringify(part.args) === JSON.stringify(call.arguments)
+          );
+
+          if (!duplicate) {
+            parts.push({
+              kind: "tool_call",
+              id: call.id,
+              name: call.name,
+              args: call.arguments
+            });
+          }
+        }
+      }
+    }
+
+    if (!parts.length) continue;
+
+    messages.push({
+      role: message.role === "assistant" ? "assistant" : "user",
+      parts
+    });
+  }
+
+  return { system: systemChunks.join("\n").trim(), messages };
+}
+
+function anthropicSystemToText(system) {
+  if (!system) return "";
+  if (typeof system === "string") return system.trim();
+
+  if (Array.isArray(system)) {
+    return system
+      .map((block) => {
+        if (!block) return "";
+        if (typeof block === "string") return block;
+        if (block.type === "text") return block.text || "";
+        return contentToText(block);
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+
+  return contentToText(system).trim();
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        协议层：工具定义归一化                                */
+/* -------------------------------------------------------------------------- */
+
+function normalizeAnthropicTools(tools) {
+  return dedupeTools(
+    tools
+      .filter((tool) => tool?.name)
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description || "",
+        parameters: tool.input_schema || { type: "object", properties: {} }
+      }))
+  );
+}
+
+function normalizeOpenAITools(body) {
+  const tools = [];
+
+  for (const tool of body.tools || []) {
+    if (tool?.type !== "function" || !tool.function?.name) continue;
+
+    tools.push({
+      name: tool.function.name,
+      description: tool.function.description || "",
+      parameters: tool.function.parameters || { type: "object", properties: {} }
+    });
+  }
+
+  for (const tool of body.functions || []) {
+    if (!tool?.name) continue;
+
+    tools.push({
+      name: tool.name,
+      description: tool.description || "",
+      parameters: tool.parameters || { type: "object", properties: {} }
+    });
+  }
+
+  return dedupeTools(tools);
+}
+
+function dedupeTools(tools) {
+  const seen = new Set();
+
+  return tools.filter((tool) => {
+    if (seen.has(tool.name)) return false;
+    seen.add(tool.name);
+    return true;
   });
-});
+}
 
-// 2. Token 计数通道 —— 【老代码核心机制：如实反馈，使 CC 客户端自动瘦身/压缩生效】
-app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
-  const estimated = estimateTokens(req.body || {});
-  res.json({ input_tokens: estimated });
-});
+function extractNativeOpenAIToolCalls(message, tools, tuning = adapt.DEFAULT_TUNING) {
+  const candidates = [];
 
-// 3. 主调度通道：POST */v1/messages (Claude Code 原生调用入口)
-app.post(/(.*)\/v1\/messages$/, async (req, res) => {
-  const startTime = Date.now();
-  const { upstreamBase } = parseTargetUrl(req);
-  const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
-  const { model, messages, stream } = req.body;
+  for (const call of Array.isArray(message?.tool_calls) ? message.tool_calls : []) {
+    candidates.push({
+      id: call?.id,
+      name: call?.function?.name,
+      arguments: call?.function?.arguments
+    });
+  }
 
-  const isCompacting = adapt.isCompactionRequest(messages);
-  const { globalTask, historyLogsText } = adapt.parseConversation(messages || []);
+  if (message?.function_call?.name) {
+    candidates.push({
+      id: null,
+      name: message.function_call.name,
+      arguments: message.function_call.arguments
+    });
+  }
 
-  logger.debug('收到 Claude Code 调度请求', {
-    '目标上游': upstreamBase,
-    '模型': model,
-    '模式': isCompacting ? '会话归档压缩 (Compaction)' : '正常流水线推进'
+  const result = [];
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    const canonicalName = adapt.resolveToolName(candidate?.name, tools);
+    const tool = adapt.getToolByName(canonicalName, tools);
+
+    if (!canonicalName || !tool) continue;
+
+    let args = candidate.arguments;
+    if (typeof args === "string") args = adapt.parseLooseJson(args);
+    if (!args || typeof args !== "object" || Array.isArray(args)) continue;
+
+    const normalized = { name: canonicalName, arguments: adapt.sanitizeToolArguments(args) };
+
+    if (
+      !tuning.emitIncompleteToolCalls &&
+      adapt.missingRequiredArguments(normalized, tool).length
+    ) {
+      continue;
+    }
+
+    const key = `${normalized.name}:${JSON.stringify(normalized.arguments)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    result.push({
+      id: candidate.id || `toolu_${uuid()}`,
+      name: normalized.name,
+      arguments: normalized.arguments
+    });
+  }
+
+  return result;
+}
+
+function mergeToolCalls(lists, tuning = adapt.DEFAULT_TUNING) {
+  const result = [];
+  const seen = new Set();
+
+  for (const list of lists) {
+    for (const call of list || []) {
+      if (!call?.name) continue;
+
+      const key = `${call.name}:${JSON.stringify(call.arguments || {})}`;
+      if (seen.has(key)) continue;
+
+      seen.add(key);
+      result.push(call);
+    }
+  }
+
+  return result.slice(0, Math.max(1, tuning.maxToolCallsPerTurn));
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            Upstream Request Logic                          */
+/* -------------------------------------------------------------------------- */
+
+const rateLimitState = new Map();
+const outboundTimestamps = new Map();
+const nextSlotAt = new Map();
+
+async function throttleOutbound(origin, minIntervalMs) {
+  if (!minIntervalMs || minIntervalMs <= 0) return 0;
+
+  const now = Date.now();
+  const earliest = Math.max(now, nextSlotAt.get(origin) || 0);
+
+  nextSlotAt.set(origin, earliest + minIntervalMs);
+
+  const waitMs = earliest - now;
+  if (waitMs > 0) await sleep(waitMs);
+
+  return waitMs;
+}
+
+function recordOutbound(origin) {
+  const now = Date.now();
+  const recent = (outboundTimestamps.get(origin) || []).filter((at) => now - at < 60000);
+
+  recent.push(now);
+  outboundTimestamps.set(origin, recent);
+
+  return recent.length;
+}
+
+async function fetchUpstreamStreamWithRetry(requestId, targetUrl, options, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+  const log = logBus.scoped(requestId);
+  const targetKey = new URL(targetUrl).origin;
+
+  const cooldown = rateLimitState.get(targetKey);
+  if (cooldown && cooldown.until > Date.now()) {
+    const remaining = Math.ceil((cooldown.until - Date.now()) / 1000);
+    throw httpError(
+      429,
+      `Upstream rate-limit cooldown is active for ${remaining}s. ` +
+        `The bridge did not send another request to ${targetKey}.`
+    );
+  }
+  if (cooldown) rateLimitState.delete(targetKey);
+
+  for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt++) {
+    const throttledMs = await throttleOutbound(
+      targetKey,
+      runtimeConfig.upstreamMinIntervalMs
+    );
+
+    const startedAt = Date.now();
+    const outboundLast60s = recordOutbound(targetKey);
+    const response = await safeFetch(targetUrl, options, timeoutMs);
+
+    if (!response || !response.headers) {
+      throw httpError(502, "Bridge did not receive a valid Response object.");
+    }
+
+    if (!response.ok) {
+      let raw = "";
+      try {
+        raw = await response.text();
+      } catch {}
+
+      const durationMs = Date.now() - startedAt;
+      log("error", "upstream.response", {
+        attempt,
+        status: response.status,
+        statusText: response.statusText || "",
+        durationMs,
+        throttledMs,
+        outboundLast60s,
+        raw: runtimeConfig.logBodies ? raw : "[logBodies=false]"
+      });
+
+      if (response.status === 429) {
+        if (!rateLimitState.has(targetKey)) {
+          rateLimitState.set(targetKey, {
+            until: Date.now() + cooldownMsFor(response),
+            sourceStatus: 429
+          });
+        }
+      }
+
+      if (isRetryableStatus(response.status) && attempt < UPSTREAM_MAX_ATTEMPTS) {
+        const delay = getRetryDelayMs(response, attempt);
+        log("warn", "upstream.retry", { attempt, status: response.status, delayMs: delay });
+        await sleep(delay);
+        continue;
+      }
+
+      throw httpError(response.status, describeUpstreamError({ raw, response }));
+    }
+
+    rateLimitState.delete(targetKey);
+    log("info", "upstream.stream_connected", {
+      attempt,
+      status: response.status,
+      contentType: response.headers.get("content-type") || ""
+    });
+
+    return response;
+  }
+
+  throw httpError(502, "Upstream connection failed after retries.");
+}
+
+function describeUpstreamError(upstream) {
+  const { raw } = upstream;
+  const status = upstream.response.status;
+  const contentType = upstream.response.headers.get("content-type") || "";
+  const server = upstream.response.headers.get("server") || "";
+  const isHtml = contentType.includes("html") || /^\s*<!doctype html/i.test(raw);
+
+  let source = "上游服务商";
+
+  if (raw.includes("Just a moment...") || raw.includes("Cloudflare")) {
+    source = "Cloudflare WAF 拦截";
+  } else if (isHtml && status === 429) {
+    source = `平台层限流（返回的是 HTML 错误页${
+      server ? `，server: ${server}` : ""
+    }，没到模型 API）`;
+  } else if (isHtml) {
+    source = `平台层错误页${server ? `，server: ${server}` : ""}`;
+  }
+
+  return `Upstream error ${status} [${source}]: ${raw.slice(0, 500)}`;
+}
+
+async function passthroughRequest(req, res, requestId, targetUrl) {
+  const hasBody = !["GET", "HEAD"].includes(req.method);
+
+  const upstream = await fetchUpstreamWithRetry(requestId, targetUrl, {
+    method: req.method,
+    headers: {
+      ...buildUpstreamHeaders(req),
+      ...(hasBody ? { "Content-Type": "application/json" } : {})
+    },
+    body: hasBody ? JSON.stringify(req.body || {}) : undefined
   });
 
-  const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
-  let heartbeatTimer = null;
-  let blockIndex = 0;
+  res.status(upstream.response.status);
+  res.setHeader(
+    "Content-Type",
+    upstream.response.headers.get("content-type") || "application/json"
+  );
+  res.send(upstream.raw);
+}
 
-  const sendSSE = (ev, data) => {
-    if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
+async function fetchUpstreamWithRetry(requestId, targetUrl, options, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+  const log = logBus.scoped(requestId);
+  const targetKey = new URL(targetUrl).origin;
+
+  const cooldown = rateLimitState.get(targetKey);
+  if (cooldown && cooldown.until > Date.now()) {
+    const remaining = Math.ceil((cooldown.until - Date.now()) / 1000);
+    throw httpError(
+      429,
+      `Upstream rate-limit cooldown is active for ${remaining}s. ` +
+        `The bridge did not send another request to ${targetKey}.`
+    );
+  }
+  if (cooldown) rateLimitState.delete(targetKey);
+
+  let last = null;
+
+  for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt++) {
+    const throttledMs = await throttleOutbound(
+      targetKey,
+      runtimeConfig.upstreamMinIntervalMs
+    );
+
+    const startedAt = Date.now();
+    const outboundLast60s = recordOutbound(targetKey);
+    const response = await safeFetch(targetUrl, options, timeoutMs);
+
+    if (!response || !response.headers) {
+      throw httpError(502, "Bridge did not receive a valid Response object.");
+    }
+
+    let raw;
+    try {
+      raw = await response.text();
+    } catch (error) {
+      throw httpError(
+        502,
+        `Cannot read upstream response body: ${error?.message || String(error)}`
+      );
+    }
+
+    const durationMs = Date.now() - startedAt;
+    last = { response, raw };
+
+    log(response.ok ? "info" : "error", "upstream.response", {
+      attempt,
+      status: response.status,
+      statusText: response.statusText || "",
+      contentType: response.headers.get("content-type") || "",
+      durationMs,
+      throttledMs,
+      outboundLast60s,
+      rawChars: raw.length,
+      headers: Object.fromEntries(response.headers.entries()),
+      raw: runtimeConfig.logBodies ? raw : "[logBodies=false]"
+    });
+
+    if (response.status === 429) {
+      if (!rateLimitState.has(targetKey)) {
+        rateLimitState.set(targetKey, {
+          until: Date.now() + cooldownMsFor(response),
+          sourceStatus: 429
+        });
+      }
+    } else if (response.ok) {
+      rateLimitState.delete(targetKey);
+    }
+
+    if (!isRetryableStatus(response.status) || attempt >= UPSTREAM_MAX_ATTEMPTS) {
+      return last;
+    }
+
+    const delay = getRetryDelayMs(response, attempt);
+    log("warn", "upstream.retry", { attempt, status: response.status, delayMs: delay });
+    await sleep(delay);
+  }
+
+  return last;
+}
+
+function cooldownMsFor(response) {
+  const retryAfter = response.headers.get("retry-after");
+  const cap = 30000;
+
+  if (!retryAfter) return 15000;
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.min(Math.ceil(seconds * 1000), cap);
+  }
+
+  const retryDate = Date.parse(retryAfter);
+  if (Number.isFinite(retryDate) && retryDate > Date.now()) {
+    return Math.min(retryDate - Date.now(), cap);
+  }
+
+  return 15000;
+}
+
+function isRetryableStatus(status) {
+  return [502, 503, 504].includes(status);
+}
+
+function getRetryDelayMs(response, attempt) {
+  const retryAfter = response.headers.get("retry-after");
+
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(Math.round(seconds * 1000), RETRY_MAX_DELAY_MS);
+    }
+
+    const asDate = Date.parse(retryAfter);
+    if (Number.isFinite(asDate)) {
+      return Math.min(Math.max(0, asDate - Date.now()), RETRY_MAX_DELAY_MS);
+    }
+  }
+
+  const base = response.status === 429 ? 3000 : 1200;
+  const jitter = Math.floor(Math.random() * 1000);
+
+  return Math.min(base * 2 ** (attempt - 1) + jitter, RETRY_MAX_DELAY_MS);
+}
+
+function buildUpstreamHeaders(req) {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    Accept: "application/json, */*"
   };
 
-  // 准确估算真实的输入 Token
-  const realInputTokens = estimateTokens(req.body);
+  const passHeaders = [
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "anthropic-version",
+    "anthropic-auth-token",
+    "idempotency-key"
+  ];
 
-  if (stream) {
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders?.();
+  for (const key of passHeaders) {
+    if (req.headers[key]) headers[key] = req.headers[key];
+  }
 
-    sendSSE('message_start', {
-      type: 'message_start',
-      message: {
-        id: msgId,
-        type: 'message',
-        role: 'assistant',
-        model: model || 'claude-3-7-sonnet',
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: realInputTokens, output_tokens: 0 }
-      }
+  if (!headers.authorization) {
+    if (req.headers["x-api-key"]) {
+      headers.authorization = `Bearer ${req.headers["x-api-key"]}`;
+    } else if (req.headers["anthropic-auth-token"]) {
+      headers.authorization = `Bearer ${req.headers["anthropic-auth-token"]}`;
+    }
+  }
+
+  return headers;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Response Format Conversion                        */
+/* -------------------------------------------------------------------------- */
+
+function buildAnthropicResponse({
+  id,
+  requestModel,
+  text,
+  reasoningText,
+  toolCalls,
+  inputTokens,
+  outputTokens
+}) {
+  const content = [];
+
+  if (reasoningText) {
+    content.push({
+      type: "thinking",
+      thinking: reasoningText,
+      signature: DUMMY_THINKING_SIGNATURE
     });
-
-    heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) res.write(': keep-alive\n\n');
-    }, 5000);
   }
 
-  try {
-    let prompt = '';
-    if (isCompacting) {
-      prompt = `请对以下任务流水线当前的历史进展提供一份结构化、简明扼要的摘要总结，包括：已完成的步骤、生成的文件清单、以及当前待推进的下一个阶段。请直接给出总结文本：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`;
-    } else {
-      // 组装你所要求的提示词模板
-      prompt = adapt.buildPipelinePrompt(globalTask, historyLogsText);
-    }
+  if (text) content.push({ type: "text", text });
 
-    const { text: assistantText, thinking } = await fetchUpstream(upstreamBase, apiKey, model, prompt);
-
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-
-    let stopReason = 'end_turn';
-    let textContent = '';
-    let toolBlock = null;
-
-    if (isCompacting) {
-      textContent = assistantText.replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '').trim() || '流水线历史状态已压缩归纳。';
-      stopReason = 'end_turn';
-    } else {
-      const parsedAction = adapt.extractActionAndThought(assistantText);
-
-      if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-        const mappedTool = adapt.mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
-        stopReason = 'tool_use';
-
-        const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
-        textContent = `调度 ${mappedTool.name} ${targetDesc ? '-> ' + targetDesc : ''}`.slice(0, 80);
-
-        toolBlock = {
-          type: 'tool_use',
-          id: 'toolu_' + crypto.randomBytes(10).toString('hex'),
-          name: mappedTool.name,
-          input: mappedTool.arguments
-        };
-
-        logger.debug('成功装配 CC 原生工具调用', {
-          '耗时': `${Date.now() - startTime}ms`,
-          '工具': mappedTool.name,
-          '参数长度': `${JSON.stringify(mappedTool.arguments).length} 字符`
-        });
-      } else {
-        textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
-        stopReason = 'end_turn';
-      }
-    }
-
-    const realOutputTokens = estimateTokens(assistantText + (thinking || ''));
-
-    if (stream) {
-      if (textContent) {
-        sendSSE('content_block_start', {
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: { type: 'text', text: '' }
-        });
-        sendSSE('content_block_delta', {
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: { type: 'text_delta', text: textContent }
-        });
-        sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-        blockIndex++;
-      }
-
-      if (toolBlock) {
-        sendSSE('content_block_start', {
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: {
-            type: 'tool_use',
-            id: toolBlock.id,
-            name: toolBlock.name,
-            input: {}
-          }
-        });
-        sendSSE('content_block_delta', {
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: {
-            type: 'input_json_delta',
-            partial_json: JSON.stringify(toolBlock.input)
-          }
-        });
-        sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-        blockIndex++;
-      }
-
-      sendSSE('message_delta', {
-        type: 'message_delta',
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: realOutputTokens }
-      });
-      sendSSE('message_stop', { type: 'message_stop' });
-      res.end();
-    } else {
-      const content = [];
-      if (textContent) content.push({ type: 'text', text: textContent });
-      if (toolBlock) content.push(toolBlock);
-
-      res.json({
-        id: msgId,
-        type: 'message',
-        role: 'assistant',
-        model,
-        content,
-        stop_reason: stopReason,
-        stop_sequence: null,
-        usage: { input_tokens: realInputTokens, output_tokens: realOutputTokens }
-      });
-    }
-  } catch (err) {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('通道异常', err.message);
-    if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
-    else res.end();
-  }
-});
-
-// 4. OpenAI 格式兼容通道
-app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
-  const { upstreamBase } = parseTargetUrl(req);
-  const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
-  const { model, messages, stream } = req.body;
-  const { globalTask, historyLogsText } = adapt.parseConversation(messages || []);
-
-  let heartbeatTimer = null;
-  if (stream) {
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders?.();
-    heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) res.write(': keep-alive\n\n');
-    }, 5000);
+  for (const call of toolCalls) {
+    content.push({
+      type: "tool_use",
+      id: call.id,
+      name: call.name,
+      input: call.arguments
+    });
   }
 
-  try {
-    const prompt = adapt.buildPipelinePrompt(globalTask, historyLogsText);
-    const { text: assistantText, thinking } = await fetchUpstream(upstreamBase, apiKey, model, prompt);
+  return {
+    id: id || `msg_${uuid()}`,
+    type: "message",
+    role: "assistant",
+    model: requestModel || "claude-sonnet-x",
+    content,
+    stop_reason: toolCalls.length ? "tool_use" : "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+  };
+}
 
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
+function buildOpenAIResponse({ model, text, reasoningText, toolCalls }) {
+  const message = { role: "assistant", content: text || null };
 
-    const parsedAction = adapt.extractActionAndThought(assistantText);
-    let toolCalls = null;
-    let finishReason = 'stop';
-    let textContent = '';
+  if (reasoningText) message.reasoning_content = reasoningText;
 
-    if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-      const mappedTool = adapt.mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
-      finishReason = 'tool_calls';
-      textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
-      toolCalls = [{
+  if (toolCalls.length) {
+    message.tool_calls = toolCalls.map((call) => ({
+      id: `call_${call.id}`,
+      type: "function",
+      function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+    }));
+  }
+
+  return {
+    id: `chatcmpl_${uuid()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: model || "tool-bridge-model",
+    choices: [
+      {
         index: 0,
-        id: 'call_' + crypto.randomBytes(8).toString('hex'),
-        type: 'function',
-        function: {
-          name: mappedTool.name,
-          arguments: JSON.stringify(mappedTool.arguments)
-        }
-      }];
-    } else {
-      textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
-      finishReason = 'stop';
-    }
+        message,
+        finish_reason: toolCalls.length ? "tool_calls" : "stop"
+      }
+    ]
+  };
+}
 
-    if (stream) {
-      if (textContent) {
-        res.write(`data: ${JSON.stringify({
-          id: 'chatcmpl-1',
-          choices: [{ delta: { content: textContent, reasoning_content: thinking }, index: 0 }]
-        })}\n\n`);
-      }
-      if (toolCalls) {
-        res.write(`data: ${JSON.stringify({
-          id: 'chatcmpl-1',
-          choices: [{ delta: { tool_calls: toolCalls }, index: 0 }]
-        })}\n\n`);
-      }
-      res.write(`data: ${JSON.stringify({
-        id: 'chatcmpl-1',
-        choices: [{ delta: {}, finish_reason: finishReason, index: 0 }]
-      })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    } else {
-      res.json({
-        id: 'chatcmpl-' + crypto.randomBytes(8).toString('hex'),
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{
-          message: {
-            role: 'assistant',
-            content: textContent,
-            reasoning_content: thinking,
-            ...(toolCalls ? { tool_calls: toolCalls } : {})
-          },
-          finish_reason: finishReason
-        }]
-      });
+/* -------------------------------------------------------------------------- */
+/*                                    SSE                                     */
+/* -------------------------------------------------------------------------- */
+
+function setupSSE(res) {
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+}
+
+function sseSend(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                URL Security                                */
+/* -------------------------------------------------------------------------- */
+
+function parseTargetFromPath(req) {
+  let raw = req.originalUrl.startsWith("/")
+    ? req.originalUrl.slice(1)
+    : req.originalUrl;
+
+  if (!/^https?:\/\//i.test(raw)) {
+    try {
+      raw = decodeURIComponent(raw);
+    } catch {
+      /* Keep original */
     }
-  } catch (err) {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('ChatCompletions 异常', err.message);
-    if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
-    else res.end();
   }
+
+  if (!/^https?:\/\//i.test(raw)) return null;
+
+  try {
+    return new URL(raw);
+  } catch {
+    throw httpError(400, "Invalid target URL.");
+  }
+}
+
+function rewriteAnthropicMessagesToOpenAI(targetUrl) {
+  const url = new URL(targetUrl);
+
+  if (/\/v1\/messages?$/i.test(url.pathname)) {
+    url.pathname = url.pathname.replace(/\/v1\/messages?$/i, "/v1/chat/completions");
+  }
+
+  return url;
+}
+
+async function validateTargetUrl(url, req = null) {
+  if (!["https:", "http:"].includes(url.protocol)) {
+    throw httpError(400, "Only http(s) target URLs are supported.");
+  }
+
+  if (url.protocol === "http:" && !ALLOW_HTTP) {
+    throw httpError(400, "HTTP targets are disabled. Use HTTPS.");
+  }
+
+  if (url.username || url.password) {
+    throw httpError(400, "Target URL must not include username/password.");
+  }
+
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+
+  if (!hostname || hostname === "localhost") {
+    throw httpError(403, "localhost target is forbidden.");
+  }
+
+  const incomingHost = getIncomingPublicHost(req);
+
+  if (incomingHost && hostname === incomingHost) {
+    throw httpError(400, "Target host is this bridge itself. Recursive self-proxy is blocked.");
+  }
+
+  if (ALLOWED_HOSTS.length && !hostAllowed(hostname)) {
+    throw httpError(403, `Target host '${hostname}' is not in ALLOWED_HOSTS.`);
+  }
+
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) throw httpError(403, "Private IP target is forbidden.");
+    return;
+  }
+
+  let records;
+
+  try {
+    records = await dns.lookup(hostname, { all: true, verbatim: true });
+  } catch {
+    throw httpError(400, `Cannot resolve target hostname: ${hostname}`);
+  }
+
+  if (!records.length) {
+    throw httpError(400, `Cannot resolve target hostname: ${hostname}`);
+  }
+
+  for (const record of records) {
+    if (isPrivateIp(record.address)) {
+      throw httpError(
+        403,
+        `Target hostname resolves to forbidden private address: ${record.address}`
+      );
+    }
+  }
+}
+
+function getIncomingPublicHost(req) {
+  if (!req?.headers) return "";
+
+  const forwarded = String(req.headers["x-forwarded-host"] || "").split(",")[0].trim();
+  const host = forwarded || String(req.headers.host || "").trim();
+
+  if (!host) return "";
+
+  return host.replace(/:\d+$/, "").toLowerCase().replace(/\.$/, "");
+}
+
+async function safeFetch(initialUrl, options, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+  let current = new URL(initialUrl);
+
+  for (let redirectCount = 0; redirectCount <= 3; redirectCount++) {
+    await validateTargetUrl(current);
+
+    let response = null;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= CONNECT_MAX_ATTEMPTS; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      
+      // 如果调用者传了 options.signal（即客户端中断），任一触发即 abort
+      const onCallerAbort = () => controller.abort();
+      if (options?.signal) {
+        options.signal.addEventListener("abort", onCallerAbort, { once: true });
+      }
+      
+      try {
+        response = await fetch(current, {
+          ...options,
+          redirect: "manual",
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+        if (options?.signal) options.signal.removeEventListener("abort", onCallerAbort);
+        break;
+      } catch (error) {
+        clearTimeout(timer);
+        if (options?.signal) options.signal.removeEventListener("abort", onCallerAbort);
+        lastError = error;
+
+        if (error?.name === "AbortError") {
+          throw httpError(504, `Upstream request timed out after ${timeoutMs}ms.`);
+        }
+
+        const isConnectIssue =
+          error?.cause?.code === "UND_ERR_CONNECT_TIMEOUT" ||
+          error?.message?.includes("fetch failed");
+
+        if (isConnectIssue && attempt < CONNECT_MAX_ATTEMPTS) {
+          await sleep(500);
+          continue;
+        }
+
+        const cause = error?.cause?.message ? ` (${error.cause.message})` : "";
+        throw httpError(
+          502,
+          `Upstream network error: ${error?.message || String(error)}${cause}`
+        );
+      }
+    }
+
+    if (!response) {
+      const cause = lastError?.cause?.message ? ` (${lastError.cause.message})` : "";
+      throw httpError(
+        502,
+        `Upstream network error after retries: ${lastError?.message || "Failed to fetch"}${cause}`
+      );
+    }
+
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+
+    const location = response.headers.get("location");
+    if (!location) throw httpError(502, "Upstream redirect has no Location header.");
+
+    const next = new URL(location, current);
+
+    if (next.host !== current.host) {
+      throw httpError(502, "Cross-host redirect is blocked to avoid credential leakage.");
+    }
+
+    current = next;
+  }
+
+  throw httpError(502, "Too many upstream redirects.");
+}
+
+function hostAllowed(hostname) {
+  return ALLOWED_HOSTS.some((rule) =>
+    rule.startsWith(".") ? hostname.endsWith(rule) : hostname === rule
+  );
+}
+
+function isPrivateIp(ip) {
+  if (ip.includes(":")) {
+    const normalized = ip.toLowerCase();
+
+    if (
+      normalized === "::1" ||
+      normalized === "::" ||
+      normalized.startsWith("fc") ||
+      normalized.startsWith("fd") ||
+      normalized.startsWith("fe80:")
+    ) {
+      return true;
+    }
+
+    const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    return mapped ? isPrivateIp(mapped[1]) : false;
+  }
+
+  const [a, b] = ip.split(".").map(Number);
+
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 198 && (b === 18 || b === 19))
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Config                                   */
+/* -------------------------------------------------------------------------- */
+
+function currentPromptText() {
+  const override = String(runtimeConfig?.toolPrompt || "").trim();
+  return override || adapt.getPreset(runtimeConfig?.promptId).text;
+}
+
+function loadConfig() {
+  try {
+    if (!fs.existsSync(CONFIG_FILE)) return structuredClone(DEFAULT_CONFIG);
+
+    const config = sanitizeConfig(JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")));
+    config.toolPrompt = "";
+    return config;
+  } catch {
+    return structuredClone(DEFAULT_CONFIG);
+  }
+}
+
+function saveConfig(config) {
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(
+      CONFIG_FILE,
+      JSON.stringify({ ...config, toolPrompt: "" }, null, 2)
+    );
+  } catch (error) {
+    process.stderr.write(`[config] Cannot persist config: ${error?.message || error}\n`);
+  }
+}
+
+function sanitizeConfig(input) {
+  const toolPrompt = String(input?.toolPrompt ?? "").trim();
+
+  if (toolPrompt.length > 100000) throw new Error("toolPrompt is too large.");
+
+  const promptId = adapt.getPreset(input?.promptId).id;
+
+  const modelMap =
+    input?.modelMap && typeof input.modelMap === "object" && !Array.isArray(input.modelMap)
+      ? Object.fromEntries(
+          Object.entries(input.modelMap)
+            .filter(([key, value]) => typeof key === "string" && typeof value === "string")
+            .map(([key, value]) => [key.trim(), value.trim()])
+            .filter(([key, value]) => key && value)
+        )
+      : {};
+
+  const logLevel = LOG_LEVELS[input?.logLevel] ? input.logLevel : DEFAULT_CONFIG.logLevel;
+
+  return {
+    includeOriginalSystem: input?.includeOriginalSystem === true,
+    promptId,
+    toolPrompt,
+    modelMap,
+    tuning: adapt.normalizeTuning(input?.tuning),
+    upstreamMinIntervalMs: clampNumber(
+      input?.upstreamMinIntervalMs,
+      DEFAULT_CONFIG.upstreamMinIntervalMs,
+      0,
+      60000
+    ),
+    logLevel,
+    logBodies: input?.logBodies !== false
+  };
+}
+
+function clampNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Small Helpers                               */
+/* -------------------------------------------------------------------------- */
+
+function ensureVisibleAssistantText(text, toolCalls, fallback) {
+  const normalized = String(text || "").trim();
+  return toolCalls.length ? normalized : normalized || fallback;
+}
+
+function contentToText(content) {
+  if (content === null || content === undefined) return "";
+
+  if (
+    typeof content === "string" ||
+    typeof content === "number" ||
+    typeof content === "boolean"
+  ) {
+    return String(content);
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (!item) return "";
+        if (typeof item === "string") return item;
+        if (item.type === "text" || item.type === "input_text") return item.text || "";
+        if (item.text) return item.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (typeof content === "object") return content.text || JSON.stringify(content);
+
+  return String(content);
+}
+
+function resolveModel(model) {
+  const requested = String(model || "").trim();
+  if (!requested) return requested;
+
+  const map = runtimeConfig.modelMap || {};
+  if (map[requested]) return map[requested];
+
+  for (const [pattern, mapped] of Object.entries(map)) {
+    if (!pattern.includes("*")) continue;
+
+    const regex = new RegExp(
+      `^${pattern
+        .split("*")
+        .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join(".*")}$`,
+      "i"
+    );
+
+    if (regex.test(requested)) return mapped;
+  }
+
+  return requested;
+}
+
+function estimateTokens(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value || {});
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function cleanUndefined(value) {
+  if (Array.isArray(value)) return value.map(cleanUndefined);
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, cleanUndefined(item)])
+    );
+  }
+
+  return value;
+}
+
+function orUndefined(list) {
+  return Array.isArray(list) && list.length ? list : undefined;
+}
+
+function uuid() {
+  return crypto.randomUUID().replaceAll("-", "");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorTypeForStatus(status) {
+  if (status === 400) return "invalid_request_error";
+  if (status === 401 || status === 403) return "authentication_error";
+  if (status === 429) return "rate_limit_error";
+  if (status === 529) return "overloaded_error";
+  return "api_error";
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Server Startup                               */
+/* -------------------------------------------------------------------------- */
+
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[tool-bridge] listening on port ${PORT}`);
 });
 
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n======================================================`);
-  console.log(` CC 智能中介已启动 (端口: ${PORT})`);
-  console.log(`======================================================\n`);
-});
-
-server.requestTimeout = 2400000;
+// 解除 Node.js 服务端默认的 5 分钟 (300000ms) 请求超时限制
+server.requestTimeout = 2400000; // 40 分钟
 server.headersTimeout = 2400000;
 server.keepAliveTimeout = 120000;
