@@ -1,13 +1,18 @@
+/* ==========================================================================
+ *  server.js —— 【网络底座与协议中继层】
+ * ========================================================================== */
+
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import { Agent, setGlobalDispatcher } from 'undici';
+import * as adapt from './adapt.js';
 
 dotenv.config();
 
-// 1. 网络底座配置：IPv4优先，undici 40分钟超长超时防断开
+// 1. 网络底座：undici 40分钟超长超时防断开
 dns.setDefaultResultOrder('ipv4first');
 setGlobalDispatcher(
   new Agent({
@@ -24,9 +29,6 @@ app.use(express.json({ limit: '100mb' }));
 const PORT = Number(process.env.PORT || 7860);
 const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 
-// ==========================================
-// 1. 结构化增量日志
-// ==========================================
 function getTimestamp() {
   return new Date().toISOString().replace('T', ' ').substring(0, 19);
 }
@@ -47,9 +49,6 @@ const logger = {
   }
 };
 
-// ==========================================
-// 2. 动态 URL 穿透解析
-// ==========================================
 function parseTargetUrl(req) {
   let raw = req.originalUrl.startsWith('/') ? req.originalUrl.slice(1) : req.originalUrl;
   if (!/^https?:\/\//i.test(raw)) {
@@ -72,648 +71,12 @@ function parseTargetUrl(req) {
   };
 }
 
-// ==========================================
-// 3. Action 与 Claude Code 原生工具适配映射器
-// ==========================================
-function mapActionToClaudeCodeTool(actionName, rawParams) {
-  const normAction = String(actionName || '').trim().toLowerCase();
-  const params = rawParams || {};
-
-  // 1. Write: {"file_path", "content"}
-  if (normAction === 'fs_write' || normAction === 'write') {
-    return {
-      name: 'Write',
-      arguments: {
-        file_path: params.file_path || params.path || 'temp.txt',
-        content: params.content !== undefined ? params.content : ''
-      }
-    };
-  }
-
-  // 2. Read: {"file_path", "limit", "offset", "pages"}
-  if (normAction === 'fs_read' || normAction === 'read') {
-    return {
-      name: 'Read',
-      arguments: {
-        file_path: params.file_path || params.path || '',
-        ...(params.limit ? { limit: Number(params.limit) } : {}),
-        ...(params.offset ? { offset: Number(params.offset) } : {})
-      }
-    };
-  }
-
-  // 3. Edit: {"file_path", "old_string", "new_string", "replace_all"}
-  if (normAction === 'fs_replace' || normAction === 'edit') {
-    return {
-      name: 'Edit',
-      arguments: {
-        file_path: params.file_path || params.path || '',
-        old_string: params.old_string !== undefined ? params.old_string : '',
-        new_string: params.new_string !== undefined ? params.new_string : '',
-        replace_all: Boolean(params.replace_all)
-      }
-    };
-  }
-
-  // 4. Bash: {"command"}
-  if (normAction === 'shell_exec' || normAction === 'bash') {
-    return {
-      name: 'Bash',
-      arguments: {
-        command: params.command || params.cmd || '',
-        ...(params.description ? { description: params.description } : {})
-      }
-    };
-  }
-
-  // 5. AskUserQuestion (严格适配 CC 复杂 schema)
-  if (normAction === 'user_prompt' || normAction === 'askuserquestion') {
-    let questions = [];
-    if (Array.isArray(params.questions)) {
-      questions = params.questions;
-    } else {
-      const qText = params.question || params.prompt || '请确认下一步操作：';
-      const rawOptions = Array.isArray(params.options) ? params.options : ['确认', '取消'];
-      const formattedOptions = rawOptions.map(opt => {
-        if (typeof opt === 'string') return { label: opt, description: opt };
-        return { label: opt.label || '选项', description: opt.description || opt.label || '' };
-      });
-
-      questions = [{
-        question: qText,
-        header: params.header || '中介决策确认',
-        multiSelect: Boolean(params.multiSelect),
-        options: formattedOptions
-      }];
-    }
-    return { name: 'AskUserQuestion', arguments: { questions } };
-  }
-
-  // 6. WebSearch: {"query"}
-  if (normAction === 'net_search' || normAction === 'websearch') {
-    return { name: 'WebSearch', arguments: { query: params.query || '' } };
-  }
-
-  // 7. WebFetch: {"url", "prompt"}
-  if (normAction === 'net_fetch' || normAction === 'webfetch') {
-    return { name: 'WebFetch', arguments: { url: params.url || '', prompt: params.prompt || '提取关键内容' } };
-  }
-
-  // 8. Agent: {"description", "prompt"}
-  if (normAction === 'subflow_spawn' || normAction === 'agent') {
-    return { name: 'Agent', arguments: { description: params.title || params.description || 'Sub-agent task', prompt: params.instructions || params.prompt || '' } };
-  }
-
-  // 9. TaskCreate / TaskUpdate
-  if (normAction === 'task_entry' || normAction === 'taskcreate' || normAction === 'taskupdate') {
-    if (params.action === 'update' || params.taskId) {
-      return { name: 'TaskUpdate', arguments: { taskId: params.taskId || params.task_id, status: params.status || 'completed' } };
-    }
-    return { name: 'TaskCreate', arguments: { subject: params.title || params.subject || '任务', description: params.description || '' } };
-  }
-
-  // 10. NotebookEdit
-  if (normAction === 'notebook_patch' || normAction === 'notebookedit') {
-    return {
-      name: 'NotebookEdit',
-      arguments: {
-        notebook_path: params.notebook_path || '',
-        cell_id: params.cell_id || '',
-        edit_mode: params.edit_mode || 'replace',
-        new_source: params.new_source || ''
-      }
-    };
-  }
-
-  // 11. EnterWorktree
-  if (normAction === 'git_worktree' || normAction === 'enterworktree') {
-    return { name: 'EnterWorktree', arguments: { name: params.name || 'worktree', path: params.path || '' } };
-  }
-
-  // 12. ReportFindings
-  if (normAction === 'code_audit' || normAction === 'reportfindings') {
-    return { name: 'ReportFindings', arguments: { findings: params.findings || [], level: params.level || 'medium' } };
-  }
-
-  // 兜底 Bash
-  return { name: 'Bash', arguments: params };
+function estimateTokens(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value || {});
+  return Math.max(1, Math.ceil(text.length / 4));
 }
 
-// ==========================================
-// 4. 对话历史解析与智能压缩引擎（完整稳定版）
-// ==========================================
-
-// 【本次修改】：定义严格的核心文档正则，兼顾各种大小写（README/TODO）并防止 autodoc 等子串误伤
-const CORE_DOCS_REGEX = /(?:^|[/\s"'\`\\])(?:todo|readme)\.(?:md|markdown|txt)(?:[/\s"'\`\\]|$)/i;
-
-function sanitizeWhitespace(text) {
-  if (!text || typeof text !== 'string') return '';
-  return text
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/[ \t]+$/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function cleanNoise(text) {
-  if (!text || typeof text !== 'string') return '';
-  const cleaned = text
-    .replace(/REMINDER:\s*You MUST include the sources[\s\S]*?hyperlinks\./gi, '')
-    .replace(/Wasted call\s*—\s*file unchanged[\s\S]*?instead\./gi, '[SUCCESS] 文件未修改，状态已是最新。')
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
-    .replace(/<total_tokens>[\s\S]*?<\/total_tokens>/gi, '')
-    .replace(/<task-notification>[\s\S]*?<\/task-notification>/gi, '')
-    .replace(/<context>[\s\S]*?<\/context>/gi, '');
-  return sanitizeWhitespace(cleaned);
-}
-
-// 【本次修改】：日志中间智能折叠，保留前后文的同时提取报错行
-function smartTruncateLog(text, limit, label = '终端日志') {
-  if (text.length <= limit) return text;
-
-  const headSize = Math.max(500, Math.floor(limit * 0.35));
-  const tailSize = Math.max(600, Math.floor(limit * 0.45));
-
-  const headPart = text.slice(0, headSize);
-  const tailPart = text.slice(-tailSize);
-  const middleContent = text.slice(headSize, -tailSize);
-
-  const lines = middleContent.split('\n');
-  const errorIndicators = [/error/i, /exception/i, /fail/i, /traceback/i, /exit code\s*[1-9]/i, /cannot access/i, /no such file/i];
-  const capturedLines = [];
-
-  for (let i = 0; i < lines.length && capturedLines.length < 25; i++) {
-    if (errorIndicators.some(reg => reg.test(lines[i]))) {
-      capturedLines.push(lines[i].trim());
-    }
-  }
-
-  const removed = text.length - headSize - tailSize;
-  let summary = `\n...[${label}中间输出已折叠 ${removed} 字符`;
-  if (capturedLines.length > 0) {
-    summary += `，提取关键异常信号：\n${capturedLines.slice(0, 8).join('\n')}\n...折叠结束]...\n`;
-  } else {
-    summary += `]...\n`;
-  }
-
-  return `${headPart}${summary}${tailPart}`;
-}
-
-// 【本次修改】：formatLocalFeedback 重构，保护 todo.md/readme.md/待办打勾条目不被腰斩
-function formatLocalFeedback(str, actionName, stepParams = {}, isLatestStep = false, stepAge = 0) {
-  if (!str) return '[SUCCESS] 操作已执行完成';
-  let text = sanitizeWhitespace(String(str));
-
-  if (/successfully|created|updated|done|completed/i.test(text) && !text.startsWith('[')) {
-    text = `[SUCCESS] ${text}`;
-  }
-
-  const cmdStr = String(stepParams.command || stepParams.cmd || '');
-  const pathStr = String(stepParams.file_path || stepParams.path || '');
-
-  // 判定是否为核心文档读取或带待办清单语法 (- [ ] / - [x])
-  const isTargetDocFile = CORE_DOCS_REGEX.test(pathStr) || CORE_DOCS_REGEX.test(cmdStr);
-  const hasChecklistMarks = /- \[[ xX]\]/m.test(text);
-  const isDocContext = isTargetDocFile || hasChecklistMarks;
-
-  // 核心文档/待办清单给予 20,000 字符超高预算，确保清单不被腰斩
-  if (isDocContext) {
-    if (text.length <= 20000) return text;
-    return smartTruncateLog(text, 20000, '核心任务/设计文档');
-  }
-
-  // 梯度动态预算：最新步（Tier 1）15000 字符，近序步 6000 字符，远期步 2500 字符
-  let budget = 3000;
-  if (isLatestStep) {
-    budget = 15000;
-  } else if (stepAge <= 2) {
-    budget = 6000;
-  } else {
-    budget = 2500;
-  }
-
-  if (actionName === 'fs_read') {
-    if (text.length > budget) return smartTruncateLog(text, budget, '文件读取');
-  } else if (actionName === 'shell_exec' || actionName === 'Bash') {
-    if (text.length > budget) return smartTruncateLog(text, budget, '命令输出');
-  } else if (actionName !== 'fs_write' && text.length > budget) {
-    return smartTruncateLog(text, budget, '执行反馈');
-  }
-
-  return text;
-}
-
-// 【本次修改】：彻底移除执行配置中的 step_thought，杜绝模型复读第一步思维；支持核心文档写入保护
-function compressHistorySteps(rawSteps) {
-  const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
-  const trimmed = validSteps.slice(-6);
-  if (trimmed.length === 0) {
-    return '（当前为初始化阶段，尚无历史记录）';
-  }
-
-  const lastReadMap = new Map();
-  trimmed.forEach((s, idx) => {
-    if (s.action === 'fs_read' && s.params?.file_path) {
-      lastReadMap.set(String(s.params.file_path).toLowerCase(), idx);
-    }
-  });
-
-  const total = trimmed.length;
-
-  return trimmed.map((step, idx) => {
-    let feedback = step.feedback || '[SUCCESS] 执行完成';
-    let params = { ...step.params };
-    const filePathStr = String(params.file_path || params.path || '');
-
-    // 大小写不敏感识别
-    const isTodoFile = /(?:^|[/\\])todo\.(?:md|markdown|txt)$/i.test(filePathStr);
-    const isReadmeFile = /(?:^|[/\\])readme\.(?:md|markdown|txt)$/i.test(filePathStr);
-
-    const stepAge = total - 1 - idx;
-    const isLatestStep = stepAge === 0;
-
-    // 1. fs_write 参数骨架化
-    if (step.action === 'fs_write') {
-      if (isTodoFile) {
-        // todo.md 完整保留，供后续打勾参考
-        params = {
-          file_path: params.file_path || 'todo.md',
-          content: step.params?.content || ''
-        };
-      } else if (isReadmeFile) {
-        const contentStr = String(step.params?.content || '');
-        if (contentStr.length <= 4000) {
-          params = { file_path: params.file_path || 'readme.md', content: contentStr };
-        } else {
-          params = { file_path: params.file_path || 'readme.md', content: `[项目规划与设计规范已写入，共 ${contentStr.length} 字符]` };
-        }
-      } else {
-        const len = step.params?.content ? String(step.params.content).length : 0;
-        params = { file_path: params.file_path || 'file' };
-        if (len > 0) {
-          params.content = `[源码/文档内容已写入，共 ${len} 字符]`;
-        }
-      }
-    }
-
-    // 2. fs_replace 参数精简
-    if (step.action === 'fs_replace') {
-      if (!isTodoFile && !isReadmeFile) {
-        if (params.old_string?.length > 100) {
-          params.old_string = params.old_string.slice(0, 40) + '...[略]...' + params.old_string.slice(-30);
-        }
-        if (params.new_string?.length > 100) {
-          params.new_string = params.new_string.slice(0, 40) + '...[略]...' + params.new_string.slice(-30);
-        }
-      }
-    }
-
-    // 3. fs_read 重复读取折叠
-    if (step.action === 'fs_read') {
-      const lowerPath = filePathStr.toLowerCase();
-      if (lastReadMap.get(lowerPath) !== idx) {
-        feedback = `[早期版本已读取，第 ${lastReadMap.get(lowerPath) + 1} 步有最新读取结果，此处折叠]`;
-      } else {
-        feedback = formatLocalFeedback(feedback, 'fs_read', params, isLatestStep, stepAge);
-      }
-    } else {
-      feedback = formatLocalFeedback(feedback, step.action, params, isLatestStep, stepAge);
-    }
-
-    // 【核心改动】：仅保留 action 与 params，绝不输出任何 step_thought
-    return `--- Step ${idx + 1} ---
-【执行配置】：
-${JSON.stringify({
-  action: step.action,
-  params: params
-}, null, 2)}
-【本地执行反馈】：
-${feedback}`;
-  }).join('\n\n');
-}
-
-// 【本次修改】：单一队列同步解析，彻底防止多轮步骤与反馈错位
-function parseConversation(messages = []) {
-  let globalTask = '';
-  const rawSteps = [];
-
-  const CC_TO_ACTION_MAP = {
-    Write: 'fs_write', Read: 'fs_read', Edit: 'fs_replace', Bash: 'shell_exec',
-    WebSearch: 'net_search', WebFetch: 'net_fetch', AskUserQuestion: 'user_prompt',
-    Agent: 'subflow_spawn', Workflow: 'subflow_spawn', TaskCreate: 'task_entry',
-    TaskUpdate: 'task_entry', NotebookEdit: 'notebook_patch', EnterWorktree: 'git_worktree',
-    ReportFindings: 'code_audit'
-  };
-
-  // 1. 提取全局任务
-  for (const msg of messages) {
-    if (msg.role === 'user') {
-      let rawText = '';
-      if (typeof msg.content === 'string') rawText = msg.content;
-      else if (Array.isArray(msg.content)) {
-        rawText = msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-      }
-      const clean = cleanNoise(rawText);
-      if (clean && !clean.startsWith('<tool_result') && !clean.includes("Today's date is") && !clean.startsWith('{')) {
-        globalTask = clean;
-        break;
-      }
-    }
-  }
-  if (!globalTask) globalTask = '推进当前工作目录下的任务推进。';
-
-  // 2. 状态机解析
-  const pendingSteps = new Map();
-  const sequentialQueue = [];
-
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-
-    if (msg.role === 'assistant') {
-      if (Array.isArray(msg.content)) {
-        for (const p of msg.content) {
-          if (p.type === 'tool_use') {
-            const mappedAction = CC_TO_ACTION_MAP[p.name] || 'shell_exec';
-            const stepObj = {
-              id: p.id || '',
-              action: mappedAction,
-              params: p.input || {}
-            };
-            if (p.id) pendingSteps.set(p.id, stepObj);
-            sequentialQueue.push(stepObj);
-          }
-        }
-      }
-
-      if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-        for (const tc of msg.tool_calls) {
-          const fnName = tc.function?.name || '';
-          const mappedAction = CC_TO_ACTION_MAP[fnName] || 'shell_exec';
-          let params = {};
-          try {
-            params = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {});
-          } catch {
-            params = {};
-          }
-          const stepObj = {
-            id: tc.id || '',
-            action: mappedAction,
-            params
-          };
-          if (tc.id) pendingSteps.set(tc.id, stepObj);
-          sequentialQueue.push(stepObj);
-        }
-      }
-
-      if (typeof msg.content === 'string' && msg.content.includes('<tool_call>')) {
-        const tcMatch = msg.content.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i);
-        if (tcMatch) {
-          try {
-            const parsed = JSON.parse(cleanLooseJson(tcMatch[1]));
-            if (parsed.name) {
-              const mappedAction = CC_TO_ACTION_MAP[parsed.name] || 'shell_exec';
-              sequentialQueue.push({
-                id: '',
-                action: mappedAction,
-                params: parsed.arguments || {}
-              });
-            }
-          } catch {}
-        }
-      }
-    } else if (msg.role === 'user' || msg.role === 'tool') {
-      const matchAndPopStep = (toolCallId) => {
-        if (toolCallId && pendingSteps.has(toolCallId)) {
-          const step = pendingSteps.get(toolCallId);
-          pendingSteps.delete(toolCallId);
-          const qIdx = sequentialQueue.findIndex(s => s.id === toolCallId);
-          if (qIdx !== -1) sequentialQueue.splice(qIdx, 1);
-          return step;
-        }
-        return sequentialQueue.shift() || null;
-      };
-
-      if (Array.isArray(msg.content)) {
-        for (const p of msg.content) {
-          if (p.type === 'tool_result') {
-            const outText = typeof p.content === 'string' ? p.content : (p.content?.map(c => c.text).join('\n') || '');
-            const matchedStep = matchAndPopStep(p.tool_use_id);
-            if (matchedStep) {
-              rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
-            }
-          }
-        }
-      } else if (msg.role === 'tool' && msg.tool_call_id) {
-        const outText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        const matchedStep = matchAndPopStep(msg.tool_call_id);
-        if (matchedStep) {
-          rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
-        }
-      } else if (typeof msg.content === 'string') {
-        const text = cleanNoise(msg.content);
-        if (text && !text.startsWith("Today's date is") && sequentialQueue.length > 0) {
-          const matchedStep = matchAndPopStep(null);
-          if (matchedStep) {
-            rawSteps.push({ ...matchedStep, feedback: text });
-          }
-        }
-      }
-    }
-  }
-
-  const historyLogsText = compressHistorySteps(rawSteps);
-  const latestTurnInput = rawSteps.length > 0 ? rawSteps[rawSteps.length - 1].feedback : '（初始启动任务）';
-
-  return { globalTask, historyLogsText, latestTurnInput };
-}
-
-// ==========================================
-// 5. 强化版抗风控 Prompt (严格模板约束)
-// ==========================================
-function buildPrompt(globalTask, historyLogsText) {
-  return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
-
-【流水线可用指令库（Action Library）】：
-1. 文件与代码管理：
-   - fs_write: {"file_path": "路径", "content": "完整文本"}
-   - fs_read: {"file_path": "路径"}
-   - fs_replace: {"file_path": "路径", "old_string": "待换原文本", "new_string": "新文本"}
-   - notebook_patch: {"notebook_path": "路径", "cell_id": "单元格ID", "edit_mode": "replace|insert|delete", "new_source": "代码"}
-2. 系统与环境交互：
-   - shell_exec: {"command": "终端Shell命令"}
-   - user_prompt: {"question": "需用户决策的问题", "options": ["选项1", "选项2"]}
-   - git_worktree: {"action": "enter|exit", "path": "隔离工作区路径"}
-3. 网络与知识检索：
-   - net_search: {"query": "搜索词"}
-   - net_fetch: {"url": "网址", "prompt": "提取目标"}
-4. 任务编排与治理：
-   - task_entry: {"action": "create|update", "title": "任务名", "status": "pending|completed"}
-   - subflow_spawn: {"title": "子任务名", "instructions": "分派执行说明"}
-   - code_audit: {"findings": [{"file": "文件", "summary": "问题描述", "verdict": "CONFIRMED"}]}
-5. 流程终结：
-   - finish: {"summary": "全部流水线验收完成后的总结报告"}
-
-【流水线设计约束】：
-1. 拆解规范：当工作流初次启动（无历史记录）时，先检查本地目录是否有 todo.md 和 readme.md 文件：
-- 若都有，检查相关内容是否与任务一致，一致则继续推进todo.md，不一致就算没有；
-- 只要有任何一个没有，第一个步骤必须对任务进行极细致的拆解（具体到单文件、单页面或单步骤），输出一个 action 为 "fs_write" 的配置，将任务项全为 [ ] 的 todo.md 写入本地，并将具体情况规划方案等写入本地 readme.md。
-2. 单步原则：每个回复只能输出当前唯一步骤的配置，不可合并多个步骤。
-3. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
-4. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n，不要打回车换行）。
-
-【强制返回格式模板示例】:
-【思考】: 说明当前步骤的意图与判断分析...
-【调度动作】: fs_write
-\`\`\`json
-{
-  "file_path": "todo.md",
-  "content": "# 任务清单\\n- [ ] 步骤一\\n- [ ] 步骤二"
-}
-\`\`\`
-
-=======================================================
-【全局目标任务】：
-${globalTask}
-=======================================================
-【历史执行记录】：
-${historyLogsText}
-=======================================================
-【当前调度决策】：
-请综合【全局目标任务】与【历史执行记录】，评估当前阶段并输出下一步操作：
-- 若不清楚任务情况，读取本地 readme.md 内容。
-- 若尚未初始化，输出生成详尽 todo.md 的单一配置。
-- 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
-- 若所有项已全部完成，输出 finish 配置。
-请输出当前步骤的配置：`;
-}
-
-// ==========================================
-// 6. 核心重构：多模态容错提取与原生工具协议装配
-// ==========================================
-function safeParseJson(str) {
-  if (!str) return null;
-  const clean = cleanLooseJson(str);
-  try {
-    return JSON.parse(clean);
-  } catch (e) {
-    try {
-      // 容错修复：将长文本（如 content）内未转义的真换行符自动转为 \n，防止 JSON.parse 崩溃
-      const fixed = clean.replace(/:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_, p1) => {
-        return ': "' + p1.replace(/\r?\n/g, '\\n') + '"';
-      });
-      return JSON.parse(fixed);
-    } catch (e2) {
-      return null;
-    }
-  }
-}
-
-function cleanLooseJson(str) {
-  return str.replace(/,\s*([}\]])/g, '$1').replace(/\r\n/g, '\n').trim();
-}
-
-function scanBalancedJsonObject(text) {
-  let depth = 0;
-  let inStr = false;
-  let quoteChar = '';
-  let escape = false;
-  let start = -1;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      if (escape) escape = false;
-      else if (ch === '\\') escape = true;
-      else if (ch === quoteChar) inStr = false;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      inStr = true;
-      quoteChar = ch;
-    } else if (ch === '{') {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0 && start !== -1) {
-        const slice = text.slice(start, i + 1);
-        const obj = safeParseJson(slice);
-        if (obj) return obj;
-        start = -1;
-      }
-    }
-  }
-  return null;
-}
-
-function extractActionAndThought(rawText) {
-  if (!rawText || typeof rawText !== 'string') return null;
-  let thought = '';
-  let action = '';
-  let params = {};
-
-  // 1. 提取【思考】内容
-  const thoughtMatch = rawText.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|```json|```|<tool_call>|$)/i);
-  if (thoughtMatch) {
-    thought = thoughtMatch[1].trim();
-  }
-
-  // 2. 提取【调度动作】指令名称
-  const actionMatch = rawText.match(/【调度动作】[：:]\s*([a-zA-Z0-9_]+)/i);
-  if (actionMatch) {
-    action = actionMatch[1].trim();
-  }
-
-  // 3. 提取代码块中的 JSON 参数
-  const mdMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  let parsedJson = null;
-  if (mdMatch) {
-    parsedJson = safeParseJson(mdMatch[1]);
-  }
-  if (!parsedJson) {
-    parsedJson = scanBalancedJsonObject(rawText);
-  }
-
-  if (parsedJson && typeof parsedJson === 'object') {
-    if (parsedJson.action) {
-      action = parsedJson.action;
-      thought = parsedJson.step_thought || parsedJson.thought || thought;
-      params = parsedJson.params || parsedJson.arguments || parsedJson;
-      if (params.action) {
-        const { action: _a, step_thought: _st, thought: _t, ...rest } = params;
-        params = rest;
-      }
-    } else if (action) {
-      params = parsedJson;
-    } else if (parsedJson.file_path && parsedJson.content !== undefined) {
-      action = 'fs_write';
-      params = parsedJson;
-    } else if (parsedJson.command) {
-      action = 'shell_exec';
-      params = parsedJson;
-    } else if (parsedJson.file_path && parsedJson.old_string !== undefined) {
-      action = 'fs_replace';
-      params = parsedJson;
-    } else if (parsedJson.file_path) {
-      action = 'fs_read';
-      params = parsedJson;
-    }
-  }
-
-  if (!thought && !action && !Object.keys(params).length) {
-    return null;
-  }
-
-  return {
-    thought: thought || '执行当前流水线步骤...',
-    action: action || 'finish',
-    params: params || {}
-  };
-}
-
-// ==========================================
-// 7. 上游通信器 (SSE 流式长连接)
-// ==========================================
+// SSE 解析生成器
 async function* readSSE(response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -743,8 +106,8 @@ async function* readSSE(response) {
   }
 }
 
-// 向上游发起纯流式请求，边读边提取，支持 Thinking 流式广播
-async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinkingChunk) {
+// 上游流式调用（聚合文本与思考）
+async function fetchUpstream(targetBase, apiKey, model, prompt) {
   const headers = {
     'Content-Type': 'application/json',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -777,7 +140,6 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
           if (payload.type === 'content_block_delta') {
             if (payload.delta?.type === 'thinking_delta' && payload.delta.thinking) {
               thinkingText += payload.delta.thinking;
-              if (onThinkingChunk) onThinkingChunk(payload.delta.thinking);
             } else if (payload.delta?.type === 'text_delta' && payload.delta.text) {
               fullText += payload.delta.text;
             }
@@ -786,9 +148,9 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
       }
       return { text: fullText, thinking: thinkingText };
     }
-  } catch (e) {}
+  } catch {}
 
-  // 2. 回退 chat/completions
+  // 2. 回退 OpenAI /v1/chat/completions
   const chatRes = await fetch(`${targetBase}/v1/chat/completions`, {
     method: 'POST',
     headers,
@@ -801,14 +163,12 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 
   if (!chatRes.ok) {
     const errText = await chatRes.text();
-    throw new Error(`上游调用完全失败: HTTP ${chatRes.status} - ${errText}`);
+    throw new Error(`上游接口响应异常: HTTP ${chatRes.status} - ${errText}`);
   }
 
   let fullText = '';
   let thinkingText = '';
   let inThinkTag = false;
-  const tagOpen = '<' + 'think>';
-  const tagClose = '<' + '/think>';
 
   for await (const chunk of readSSE(chatRes)) {
     if (!chunk || chunk === '[DONE]') continue;
@@ -816,36 +176,20 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
       const payload = JSON.parse(chunk);
       const delta = payload.choices?.[0]?.delta;
       if (delta) {
-        const think = delta.reasoning_content || delta.reasoning || '';
-        if (think) {
-          thinkingText += think;
-          if (onThinkingChunk) onThinkingChunk(think);
+        if (delta.reasoning_content || delta.reasoning) {
+          thinkingText += delta.reasoning_content || delta.reasoning;
         }
-
         if (delta.content) {
           let piece = delta.content;
           while (piece.length > 0) {
             if (!inThinkTag) {
-              const start = piece.indexOf(tagOpen);
-              if (start !== -1) {
-                fullText += piece.slice(0, start);
-                inThinkTag = true;
-                piece = piece.slice(start + tagOpen.length);
-              } else {
-                fullText += piece;
-                piece = '';
-              }
-            } else {
-              const end = piece.indexOf(tagClose);
+              const start = piece.indexOf('<think>');
               if (end !== -1) {
-                const tPiece = piece.slice(0, end);
-                thinkingText += tPiece;
-                if (onThinkingChunk) onThinkingChunk(tPiece);
+                thinkingText += piece.slice(0, end);
                 inThinkTag = false;
-                piece = piece.slice(end + tagClose.length);
+                piece = piece.slice(end + 8);
               } else {
                 thinkingText += piece;
-                if (onThinkingChunk) onThinkingChunk(piece);
                 piece = '';
               }
             }
@@ -854,24 +198,25 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
       }
     } catch {}
   }
+
   return { text: fullText, thinking: thinkingText };
 }
 
 // ==========================================
-// 8. 路由: /v1/models 与 /v1/messages/count_tokens
+// 路由定义
 // ==========================================
+
+// 1. 模型列表
 app.get(/(.*)\/v1\/models$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
-  logger.debug('拉取模型列表', { 目标上游: upstreamBase });
-
   try {
     const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
     const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
       headers: { 'Authorization': authHeader, 'x-api-key': req.headers['x-api-key'] || '' },
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(8000)
     });
     if (upstreamRes.ok) return res.json(await upstreamRes.json());
-  } catch (e) {}
+  } catch {}
 
   res.json({
     object: 'list',
@@ -882,42 +227,26 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
   });
 });
 
-// 【本次修改】：设置安全上限（≤10000），防止 Claude Code 客户端计算超标触发本地“Prompt is too long”
+// 2. Token 计数通道 —— 【老代码核心机制：如实反馈，使 CC 客户端自动瘦身/压缩生效】
 app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
-  const bodyText = JSON.stringify(req.body || {});
-  const rawTokens = Math.ceil(bodyText.length / 4);
-  const safeTokens = Math.min(rawTokens, 10000);
-  res.json({ input_tokens: safeTokens });
+  const estimated = estimateTokens(req.body || {});
+  res.json({ input_tokens: estimated });
 });
 
-// 【本次修改】：判定是否为 Claude Code 触发的会话自动压缩/摘要请求
-function isCompactionRequest(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return false;
-  const lastMsg = messages[messages.length - 1];
-  const content = typeof lastMsg.content === 'string' 
-    ? lastMsg.content 
-    : (Array.isArray(lastMsg.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
-  return /summary of the conversation so far|summarize the conversation|compact|create a detailed summary/i.test(content);
-}
-
-// ==========================================
-// 9. 核心路由: POST */v1/messages (Claude Code 主通道)
-// ==========================================
+// 3. 主调度通道：POST */v1/messages (Claude Code 原生调用入口)
 app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const startTime = Date.now();
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
   const { model, messages, stream } = req.body;
 
-  // 【本次修改】：识别压缩请求，确保 CC 自动瘦身流程正常执行
-  const isCompacting = isCompactionRequest(messages);
-  const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
-  
+  const isCompacting = adapt.isCompactionRequest(messages);
+  const { globalTask, historyLogsText } = adapt.parseConversation(messages || []);
+
   logger.debug('收到 Claude Code 调度请求', {
     '目标上游': upstreamBase,
     '模型': model,
-    '压缩模式': isCompacting ? '是 (Compaction)' : '否',
-    '本次增量输入': latestTurnInput || '（初始启动任务）'
+    '模式': isCompacting ? '会话归档压缩 (Compaction)' : '正常流水线推进'
   });
 
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
@@ -928,11 +257,15 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
+  // 准确估算真实的输入 Token
+  const realInputTokens = estimateTokens(req.body);
+
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
+
     sendSSE('message_start', {
       type: 'message_start',
       message: {
@@ -943,9 +276,10 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 150, output_tokens: 0 }
+        usage: { input_tokens: realInputTokens, output_tokens: 0 }
       }
     });
+
     heartbeatTimer = setInterval(() => {
       if (!res.writableEnded) res.write(': keep-alive\n\n');
     }, 5000);
@@ -956,19 +290,11 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     if (isCompacting) {
       prompt = `请对以下任务流水线当前的历史进展提供一份结构化、简明扼要的摘要总结，包括：已完成的步骤、生成的文件清单、以及当前待推进的下一个阶段。请直接给出总结文本：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`;
     } else {
-      prompt = buildPrompt(globalTask, historyLogsText);
+      // 组装你所要求的提示词模板
+      prompt = adapt.buildPipelinePrompt(globalTask, historyLogsText);
     }
 
-    // 【本次修改】：彻底关闭向 Claude Code 下发 thinking SSE，避免数万字符累积撑爆客户端上下文
-    const onThinkingChunk = null;
-
-    const { text: assistantText } = await fetchUpstreamStream(
-      upstreamBase,
-      apiKey,
-      model,
-      prompt,
-      onThinkingChunk
-    );
+    const { text: assistantText, thinking } = await fetchUpstream(upstreamBase, apiKey, model, prompt);
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
@@ -977,18 +303,15 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     let toolBlock = null;
 
     if (isCompacting) {
-      // 压缩模式：返回纯文本，让 CC 顺利完成本地上下文归档
       textContent = assistantText.replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '').trim() || '流水线历史状态已压缩归纳。';
       stopReason = 'end_turn';
     } else {
-      // 正常执行模式：解析动作
-      const parsedAction = extractActionAndThought(assistantText);
+      const parsedAction = adapt.extractActionAndThought(assistantText);
 
       if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-        const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+        const mappedTool = adapt.mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
         stopReason = 'tool_use';
-        
-        // 【本次修改】：下发给客户端的提示文本压制在单句，杜绝把万字长文回塞客户端历史
+
         const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
         textContent = `调度 ${mappedTool.name} ${targetDesc ? '-> ' + targetDesc : ''}`.slice(0, 80);
 
@@ -1001,8 +324,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
 
         logger.debug('成功装配 CC 原生工具调用', {
           '耗时': `${Date.now() - startTime}ms`,
-          '下发原生工具': mappedTool.name,
-          '参数大小': `${JSON.stringify(mappedTool.arguments).length} 字符`
+          '工具': mappedTool.name,
+          '参数长度': `${JSON.stringify(mappedTool.arguments).length} 字符`
         });
       } else {
         textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
@@ -1010,8 +333,9 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       }
     }
 
+    const realOutputTokens = estimateTokens(assistantText + (thinking || ''));
+
     if (stream) {
-      // 1. 发送精炼说明文本
       if (textContent) {
         sendSSE('content_block_start', {
           type: 'content_block_start',
@@ -1027,7 +351,6 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         blockIndex++;
       }
 
-      // 2. 发送工具调用块
       if (toolBlock) {
         sendSSE('content_block_start', {
           type: 'content_block_start',
@@ -1051,11 +374,10 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         blockIndex++;
       }
 
-      // 3. 发送 message_delta 结束本轮
       sendSSE('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: 300 }
+        usage: { output_tokens: realOutputTokens }
       });
       sendSSE('message_stop', { type: 'message_stop' });
       res.end();
@@ -1072,30 +394,23 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         content,
         stop_reason: stopReason,
         stop_sequence: null,
-        usage: { input_tokens: 150, output_tokens: 300 }
+        usage: { input_tokens: realInputTokens, output_tokens: realOutputTokens }
       });
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('Claude Code 消息通道异常', err.message);
+    logger.error('通道异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
 });
 
-// ==========================================
-// 10. OpenWebUI / OpenAI 兼容通道
-// ==========================================
+// 4. OpenAI 格式兼容通道
 app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
-  const startTime = Date.now();
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
   const { model, messages, stream } = req.body;
-  const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
-  logger.debug('收到 OpenAI/ChatCompletions 调度请求', {
-    目标上游: upstreamBase,
-    本次增量输入: latestTurnInput || '（初始启动任务）'
-  });
+  const { globalTask, historyLogsText } = adapt.parseConversation(messages || []);
 
   let heartbeatTimer = null;
   if (stream) {
@@ -1109,30 +424,23 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   }
 
   try {
-    const prompt = buildPrompt(globalTask, historyLogsText);
-    const { text: assistantText, thinking } = await fetchUpstreamStream(
-      upstreamBase,
-      apiKey,
-      model,
-      prompt,
-      null
-    );
+    const prompt = adapt.buildPipelinePrompt(globalTask, historyLogsText);
+    const { text: assistantText, thinking } = await fetchUpstream(upstreamBase, apiKey, model, prompt);
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
-    const parsedAction = extractActionAndThought(assistantText);
-    const callId = 'call_' + crypto.randomBytes(8).toString('hex');
+    const parsedAction = adapt.extractActionAndThought(assistantText);
     let toolCalls = null;
     let finishReason = 'stop';
     let textContent = '';
 
     if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+      const mappedTool = adapt.mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
       finishReason = 'tool_calls';
       textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
       toolCalls = [{
         index: 0,
-        id: callId,
+        id: 'call_' + crypto.randomBytes(8).toString('hex'),
         type: 'function',
         function: {
           name: mappedTool.name,
@@ -1145,21 +453,18 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     }
 
     if (stream) {
-      // 1. 发送思考正文
       if (textContent) {
         res.write(`data: ${JSON.stringify({
           id: 'chatcmpl-1',
           choices: [{ delta: { content: textContent, reasoning_content: thinking }, index: 0 }]
         })}\n\n`);
       }
-      // 2. 发送标准工具调用块
       if (toolCalls) {
         res.write(`data: ${JSON.stringify({
           id: 'chatcmpl-1',
           choices: [{ delta: { tool_calls: toolCalls }, index: 0 }]
         })}\n\n`);
       }
-      // 3. 结束流并指示 finish_reason 为 tool_calls
       res.write(`data: ${JSON.stringify({
         id: 'chatcmpl-1',
         choices: [{ delta: {}, finish_reason: finishReason, index: 0 }]
@@ -1185,7 +490,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    logger.error('ChatCompletions 消息通道异常', err.message);
+    logger.error('ChatCompletions 异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
@@ -1193,8 +498,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(` CC Web 智能中介（深度格式兼容修复版）已就绪 (端口: ${PORT})`);
-  console.log(` 调试模式: ${IS_DEBUG ? '开启 (DEBUG=true)' : '关闭 (仅错误日志)'}`);
+  console.log(` CC 智能中介已启动 (端口: ${PORT})`);
   console.log(`======================================================\n`);
 });
 
