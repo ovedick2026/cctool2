@@ -1231,3 +1231,503 @@ function expandToolCallStart(text, callStart) {
   }
   return earliest;
 }
+
+/* ==========================================================================
+ *  【补回遗漏的底层函数】：JSON 解析、深度容错与 XML/畸形提取
+ *  server.js 和 extractToolCalls 通道 2 强依赖这部分函数
+ * ========================================================================== */
+
+function indexOfCaseless(text, needle, from) {
+  return text.toLowerCase().indexOf(needle.toLowerCase(), from);
+}
+
+/**
+ * 候选片段收集器（支持标准JSON、内联名、XML invoke、GLM等）
+ */
+export function collectToolCallCandidates(text) {
+  const candidates = [];
+  const seen = new Set();
+
+  const add = (candidate) => {
+    const key = `${candidate.kind}:${candidate.start}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(candidate);
+  };
+
+  // (a)(b)(c)(g) 裸 JSON / 标准形态
+  const jsonPattern = /\{\s*"name"\s*:\s*"([^"]+)"/g;
+  let match;
+
+  while ((match = jsonPattern.exec(text)) !== null) {
+    const start = match.index;
+    const closeTag = text.indexOf("</tool_call>", start);
+    const nextTag = text.indexOf("<tool_call", start + 1);
+
+    let end = text.length;
+    if (closeTag >= 0) end = closeTag + "</tool_call>".length;
+    else if (nextTag >= 0) end = nextTag;
+
+    add({
+      kind: "json",
+      start,
+      end,
+      name: match[1],
+      inlineName: null,
+      raw: text.slice(start, end)
+    });
+  }
+
+  // (d) <tool_call>ToolName{...}</tool_call>
+  if (text.includes("<tool_call")) {
+    const inlinePattern =
+      /<tool_call\b[^>]*>\s*([a-zA-Z_][a-zA-Z0-9_.\-]{0,63})\s*(?=\{)/gi;
+
+    while ((match = inlinePattern.exec(text)) !== null) {
+      const start = match.index;
+      const closeTag = text.indexOf("</tool_call>", start);
+      const end = closeTag >= 0 ? closeTag + "</tool_call>".length : text.length;
+
+      add({
+        kind: "json",
+        start,
+        end,
+        name: match[1],
+        inlineName: match[1],
+        raw: text.slice(start, end)
+      });
+    }
+  }
+
+  // (i) Anthropic XML 风格：<invoke name="X"><parameter name="y">值</parameter></invoke>
+  if (/<(?:[\w-]+:)?invoke\b/i.test(text)) {
+    const invokePattern =
+      /<(?:[\w-]+:)?invoke\s+name\s*=\s*["']?([A-Za-z_][A-Za-z0-9_.\-]{0,63})["']?\s*>/gi;
+
+    while ((match = invokePattern.exec(text)) !== null) {
+      const start = match.index;
+      const closeIndex = indexOfCaseless(text, "</invoke", start);
+      const end = closeIndex >= 0 ? closeIndex + "</invoke>".length : text.length;
+
+      add({
+        kind: "xml",
+        start,
+        end,
+        name: match[1],
+        inlineName: null,
+        raw: text.slice(start, end)
+      });
+    }
+  }
+
+  // (f) GLM 的 <arg_key>/<arg_value>
+  return text.toLowerCase().includes("</arg_key>")
+    ? collectTaggedCandidates(text, candidates, add)
+    : candidates.sort((a, b) => a.start - b.start);
+}
+
+function collectTaggedCandidates(text, candidates, add) {
+  const taggedPattern =
+    /(?:<tool_call\b[^>]*>\s*)?([a-zA-Z_][a-zA-Z0-9_.\-]{0,63})[\s\S]{0,160}?<\/arg_key>/gi;
+
+  let match;
+
+  while ((match = taggedPattern.exec(text)) !== null) {
+    const start = match.index;
+    const lookaheadFrom = match.index + match[0].length;
+
+    const hasArgValue = /<arg_value>/i.test(
+      match[0] + text.slice(lookaheadFrom, lookaheadFrom + 400)
+    );
+
+    if (!hasArgValue) continue;
+
+    const closeTag = text.indexOf("</tool_call>", start);
+    const argValueEnd = text.indexOf("</arg_value>", start);
+
+    let end = closeTag >= 0 ? closeTag + "</tool_call>".length : text.length;
+    if (argValueEnd >= 0 && closeTag < 0) {
+      end = argValueEnd + "</arg_value>".length;
+    }
+
+    add({
+      kind: "tagged",
+      start,
+      end,
+      name: match[1],
+      inlineName: null,
+      raw: text.slice(start, end)
+    });
+  }
+
+  return candidates.sort((a, b) => a.start - b.start);
+}
+
+/** XML 调用恢复 */
+export function recoverXmlToolCall(raw, declaredName, tool) {
+  const canonicalName = tool?.name || declaredName;
+  if (!canonicalName) return null;
+
+  const paramPattern =
+    /<(?:[\w-]+:)?parameter\s+name\s*=\s*["']?([^"'>\s]+)["']?\s*>/gi;
+
+  const args = {};
+  let match;
+
+  while ((match = paramPattern.exec(raw)) !== null) {
+    const key = match[1];
+    const valueStart = match.index + match[0].length;
+
+    const closeParam = indexOfCaseless(raw, "</parameter", valueStart);
+    const closeInvoke = indexOfCaseless(raw, "</invoke", valueStart);
+
+    let end = raw.length;
+    if (closeParam >= 0) end = closeParam;
+    if (closeInvoke >= 0 && closeInvoke < end) end = closeInvoke;
+
+    args[key] = coerceXmlParamValue(raw.slice(valueStart, end), key, tool);
+  }
+
+  return Object.keys(args).length ? { name: canonicalName, arguments: args } : null;
+}
+
+function coerceXmlParamValue(rawValue, key, tool) {
+  const text = String(rawValue ?? "").trim();
+  const type = tool?.parameters?.properties?.[key]?.type;
+
+  if (type === "number" || type === "integer") {
+    const asNumber = Number(text);
+    return Number.isFinite(asNumber) ? asNumber : text;
+  }
+
+  if (type === "boolean") {
+    if (text === "true") return true;
+    if (text === "false") return false;
+    return text;
+  }
+
+  if (type === "object" || type === "array") {
+    return parseLooseJson(text) ?? text;
+  }
+
+  return text;
+}
+
+/** GLM 标签调用恢复 */
+export function recoverTaggedToolCall(raw, declaredName, tool) {
+  const canonicalName = tool?.name || declaredName;
+  if (!canonicalName || !tool) return null;
+
+  const equalIndex = raw.indexOf("=");
+
+  if (equalIndex >= 0) {
+    for (const objectText of extractBalancedJsonObjects(raw.slice(equalIndex + 1))) {
+      const parsed = parseLooseJson(objectText);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+
+      if (
+        parsed.name &&
+        parsed.arguments &&
+        typeof parsed.arguments === "object" &&
+        !Array.isArray(parsed.arguments)
+      ) {
+        return { name: parsed.name, arguments: parsed.arguments };
+      }
+
+      return { name: canonicalName, arguments: parsed };
+    }
+  }
+
+  const properties = Object.keys(tool.parameters?.properties || {});
+  const args = {};
+
+  for (const key of properties) {
+    const pattern = new RegExp(
+      `(?:<arg_key>\\s*)?${escapeRegExp(
+        key
+      )}\\s*</arg_key>\\s*<arg_value>\\s*([\\s\\S]*?)\\s*</arg_value>`,
+      "i"
+    );
+
+    const pair = pattern.exec(raw);
+    if (pair) args[key] = decodeLooseToolString(pair[1].trim());
+  }
+
+  return Object.keys(args).length ? { name: canonicalName, arguments: args } : null;
+}
+
+/** 畸形/裸参数调用恢复 */
+export function recoverMalformedToolCall(raw, inlineName = null, tool = null) {
+  if (inlineName) {
+    const objectStart = raw.indexOf("{");
+    const objectEnd = findLooseOuterObjectEnd(raw, objectStart);
+
+    if (objectStart < 0 || objectEnd <= objectStart) return null;
+
+    const argsText = raw.slice(objectStart, objectEnd);
+    const strict = parseLooseJson(argsText);
+
+    if (strict && typeof strict === "object" && !Array.isArray(strict)) {
+      return { name: inlineName, arguments: strict };
+    }
+
+    return { name: inlineName, arguments: recoverLooseArguments(argsText, tool) };
+  }
+
+  for (const objectText of extractBalancedJsonObjects(raw)) {
+    const parsed = parseLooseJson(objectText);
+    if (!parsed?.name || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+
+    if (
+      parsed.arguments &&
+      typeof parsed.arguments === "object" &&
+      !Array.isArray(parsed.arguments)
+    ) {
+      return { name: parsed.name, arguments: parsed.arguments };
+    }
+
+    const { name, ...rest } = parsed;
+    return { name, arguments: rest };
+  }
+
+  const nameMatch = raw.match(/"name"\s*:\s*"([^"]+)"/i);
+  if (!nameMatch) return null;
+
+  const name = nameMatch[1];
+  const argumentsMatch = /"arguments"\s*:\s*\{/.exec(raw);
+  let argumentsText = "";
+
+  if (argumentsMatch) {
+    const start = argumentsMatch.index + argumentsMatch[0].lastIndexOf("{");
+    const end = findLooseArgumentsEnd(raw, start);
+    if (end > start) argumentsText = raw.slice(start, end);
+  } else {
+    argumentsText = raw;
+  }
+
+  if (!argumentsText) return null;
+
+  const strict = parseLooseJson(argumentsText);
+  if (strict && typeof strict === "object" && !Array.isArray(strict)) {
+    return { name, arguments: strict };
+  }
+
+  const loose = recoverLooseArguments(argumentsText, tool);
+  return Object.keys(loose).length ? { name, arguments: loose } : null;
+}
+
+function recoverLooseArguments(argumentsText, tool) {
+  const properties = Object.keys(tool?.parameters?.properties || {});
+  const result = {};
+
+  for (const key of properties) {
+    const value = extractLooseArgumentValue(argumentsText, key, properties);
+    if (value !== null) result[key] = value;
+  }
+
+  return result;
+}
+
+function extractLooseArgumentValue(text, key, allKeys) {
+  const match = new RegExp(`"${escapeRegExp(key)}"\\s*:\\s*`, "i").exec(text);
+  if (!match) return null;
+
+  const valueStart = match.index + match[0].length;
+  const tail = text.slice(valueStart);
+
+  if (!tail.startsWith('"')) {
+    const nextField = /(?:[}\]\s]*),\s*"[^"]+"\s*:/.exec(tail);
+
+    let rawValue = nextField
+      ? tail.slice(0, nextField.index)
+      : tail.replace(/}\s*$/g, "");
+
+    rawValue = rawValue.trim().replace(/,\s*$/g, "");
+
+    if (!rawValue) return null;
+    if (rawValue === "true") return true;
+    if (rawValue === "false") return false;
+    if (rawValue === "null") return null;
+
+    const asNumber = Number(rawValue);
+    if (Number.isFinite(asNumber) && rawValue !== "") return asNumber;
+
+    return parseLooseJson(rawValue) ?? rawValue;
+  }
+
+  const contentStart = valueStart + 1;
+  const afterQuote = text.slice(contentStart);
+
+  let end = -1;
+
+  const nextAnyField = /(?:[}\]\s]*),\s*"[^"]+"\s*:/.exec(afterQuote);
+  if (nextAnyField) end = contentStart + nextAnyField.index;
+
+  if (end < 0 && Array.isArray(allKeys) && allKeys.length > 1) {
+    const otherKeys = allKeys.filter((item) => item !== key).map(escapeRegExp);
+
+    if (otherKeys.length) {
+      const nextKnown = new RegExp(
+        `(?:[}\\]\\s]*),\\s*"(${otherKeys.join("|")})"\\s*:`,
+        "i"
+      ).exec(afterQuote);
+
+      if (nextKnown) end = contentStart + nextKnown.index;
+    }
+  }
+
+  if (end < 0) {
+    const doubleClose = afterQuote.search(/}\s*}/);
+    if (doubleClose >= 0) end = contentStart + doubleClose;
+  }
+
+  if (end < 0) {
+    const finalClose = afterQuote.lastIndexOf("}");
+    if (finalClose >= 0) end = contentStart + finalClose;
+  }
+
+  if (end < 0) end = text.length;
+
+  let rawValue = text
+    .slice(contentStart, end)
+    .replace(/,\s*$/g, "")
+    .replace(/}\s*$/g, "")
+    .trim();
+
+  if (!rawValue) return "";
+
+  if (rawValue.endsWith('"')) {
+    const withoutLast = rawValue.slice(0, -1);
+    if (countUnescapedQuotes(withoutLast) % 2 === 0) rawValue = withoutLast;
+  }
+
+  return decodeLooseToolString(rawValue);
+}
+
+/** 【关键核心导出】：宽松 JSON 解析（server.js 显式调用） */
+export function parseLooseJson(value) {
+  if (!value || typeof value !== "string") return null;
+
+  const text = value
+    .trim()
+    .replace(/^```(?:json|tool_calls)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .replace(/,\s*([}\]])/g, "$1");
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    /* 继续尝试 */
+  }
+
+  const objects = extractBalancedJsonObjects(text);
+
+  if (objects.length === 1) {
+    try {
+      return JSON.parse(objects[0]);
+    } catch {
+      /* 放弃 */
+    }
+  }
+
+  return null;
+}
+
+/** 提取平衡的花括号块 */
+export function extractBalancedJsonObjects(text) {
+  const result = [];
+
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") {
+      if (depth === 0) start = index;
+      depth++;
+      continue;
+    }
+
+    if (char === "}" && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        result.push(text.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return result;
+}
+
+function findLooseArgumentsEnd(text, start) {
+  const tail = text.slice(start);
+  const doubleClose = /}\s*}/.exec(tail);
+
+  if (doubleClose) return start + doubleClose.index + 1;
+
+  const lastClose = tail.lastIndexOf("}");
+  return lastClose >= 0 ? start + lastClose + 1 : -1;
+}
+
+function findLooseOuterObjectEnd(text, start) {
+  if (start < 0) return -1;
+
+  const objects = extractBalancedJsonObjects(text.slice(start));
+  if (objects.length) return start + objects[0].length;
+
+  const tail = text.slice(start);
+  const lastClose = tail.lastIndexOf("}");
+
+  return lastClose >= 0 ? start + lastClose + 1 : -1;
+}
+
+function countUnescapedQuotes(text) {
+  let count = 0;
+  let escaped = false;
+
+  for (const char of String(text || "")) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') count++;
+  }
+
+  return count;
+}
+
+export function decodeLooseToolString(value) {
+  const text = String(value ?? "");
+
+  try {
+    return JSON.parse(`"${text}"`);
+  } catch {
+    return text
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
+}
