@@ -42,7 +42,7 @@
 *     都必须调 log(...)。上一版最大的问题就是工具调用被静默丢掉，
 *     日志里一个字都看不到，导致完全没法排查。
 *
-_==========================================================================_ /
+/*==========================================================================*/
 /* ==========================================================================
 *  第一部分：提示词预设
 *  ------------------------------------------------------------------------
@@ -54,7 +54,7 @@ _==========================================================================_ /
 *    {{force_tool_instruction}}   根据 tool_choice 自动生成的强制说明
 *    {{protocol_rules}}           下面 PROTOCOL_RULES 的内容
 *                                 （模板里没写这个占位符的话会自动追加到末尾）
-_==========================================================================_ /
+/*==========================================================================*/
 /** 所有预设共用的协议硬约束。改格式规则改这里，改行为风格改各个预设。 */
 export const PROTOCOL_RULES = `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
 
@@ -286,7 +286,7 @@ export function mapActionToClaudeCodeTool(actionName, rawParams = {}) {
 *  ------------------------------------------------------------------------
 *  这里每一项在网页「调参」面板里都有对应控件。加一项就自动多一个控件。
 *  改默认值改这里；临时试值在网页上改。
-_==========================================================================_ /
+*==========================================================================*/
 export const DEFAULT_TUNING = {
   // ---- 上下文压缩 -------------------------------------------------------
   /** 最近 N 条消息原样保留、绝不压缩。太小会让模型忘记刚做过什么。 */
@@ -708,6 +708,8 @@ export function compressHistory(convo, tuning = DEFAULT_TUNING, log = () => {}) 
 
   return {
     ...convo,
+    system: convo?.system || "",
+    messages,
     _globalTask: globalTask,
     _historyLogsText: historyLogsText
   };
@@ -796,8 +798,8 @@ ${historyLogsText}
 }
 
 /* ==========================================================================
-*  第六部分：防死循环
-_==========================================================================_ /
+ *  第六部分：防死循环（修复 SyntaxError 缺失的开括号）
+ * ========================================================================== */
 /**
 * 在结构化数据上比对，而不是在被截断的文本上比对。
 * 上一版在截断后的字符串上比，两次不同的 Edit 被砍在同一位置就会
@@ -813,7 +815,7 @@ export function detectRepeatedToolCall(convo, tuning = DEFAULT_TUNING) {
     if (msg?.role !== "assistant") continue;
     for (const part of msg.parts || []) {
       if (part?.kind === "tool_call") {
-        signatures.push`${part.name}:${stableStringify(part.args)}`);
+        signatures.push(`${part.name}:${stableStringify(part.args)}`);
       }
     }
   }
@@ -832,8 +834,8 @@ function stableStringify(value) {
     .join(",")}}`;
 }
 /* ==========================================================================
-*  第七部分：模型回复清洗
-_==========================================================================_ /
+ *  第七部分：模型回复清洗
+ * ==========================================================================*/
 /**
 * 剥离 <think> 标签（含未闭合的），防止思维链泄漏给 Claude Code 导致卡死。
 * @returns {{text:string, thinking:string}}
@@ -1105,7 +1107,7 @@ export function extractToolCalls(
 
 /* ==========================================================================
 *  第九部分：stop 序列
-_==========================================================================_ /
+/*==========================================================================*/
 export function buildStopSequences(clientStop, tools, tuning = DEFAULT_TUNING) {
   const stops = [];
   if (Array.isArray(clientStop)) stops.push(...clientStop.filter(Boolean));
@@ -1119,4 +1121,113 @@ export function buildStopSequences(clientStop, tools, tuning = DEFAULT_TUNING) {
   }
   // 大多数上游最多接受 4 个 stop，超了会直接 400
   return stops.slice(0, 4);
+}
+
+/* ==========================================================================
+ *  工具名解析、参数归一化与校验（供 server.js 与双保险通道 2 调用）
+ * ========================================================================== */
+export function normalizeToolNameKey(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_.\-:/]+/g, "");
+}
+
+export function resolveToolName(name, tools) {
+  const requested = String(name || "").trim();
+  if (!requested || !Array.isArray(tools)) return "";
+  const exact = tools.find((tool) => tool?.name === requested);
+  if (exact?.name) return exact.name;
+  const normalized = normalizeToolNameKey(requested);
+  const matches = tools.filter(
+    (tool) => tool?.name && normalizeToolNameKey(tool.name) === normalized
+  );
+  return matches.length === 1 ? matches[0].name : "";
+}
+
+export function getToolByName(name, tools) {
+  const canonical = resolveToolName(name, tools);
+  return canonical ? tools.find((tool) => tool?.name === canonical) || null : null;
+}
+
+export function missingRequiredArguments(call, tool) {
+  const required = Array.isArray(tool?.parameters?.required)
+    ? tool.parameters.required
+    : [];
+  return required.filter((key) => {
+    const value = call?.arguments?.[key];
+    if (value === undefined || value === null) return true;
+    if (typeof value === "string" && !value.trim()) return true;
+    return false;
+  });
+}
+
+export function normalizeParsedCall(candidate, tools) {
+  if (!candidate || typeof candidate !== "object") return null;
+  const requested =
+    candidate.name ||
+    candidate.tool ||
+    candidate.function?.name ||
+    candidate.function_name;
+  const canonicalName = resolveToolName(requested, tools);
+  if (!canonicalName) return null;
+  let args =
+    candidate.arguments ??
+    candidate.input ??
+    candidate.parameters ??
+    candidate.function?.arguments ??
+    candidate.function?.input ??
+    {};
+  if (typeof args === "string") args = parseLooseJson(args) || null;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  return { name: canonicalName, arguments: sanitizeToolArguments(args) };
+}
+
+export function sanitizeToolArguments(value) {
+  if (typeof value === "string") {
+    return value
+      .replace(/\[(https?:\/\/[^\]]+)\]\(\1\)/g, "$1")
+      .replace(/\*\*(https?:\/\/[^*]+)\*\*/g, "$1");
+  }
+  if (Array.isArray(value)) return value.map(sanitizeToolArguments);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, sanitizeToolArguments(item)])
+    );
+  }
+  return value;
+}
+
+export function cleanResidualTags(text) {
+  return String(text || "")
+    .replace(/<\/?(tool_call|invoke|function|function_calls|parameter)[^>]*>/gi, "")
+    .replace(/<\/?think>/gi, "")
+    .trim();
+}
+
+export function clip(text, limit = 600) {
+  const source = String(text || "");
+  return source.length > limit ? `${source.slice(0, limit)}…` : source;
+}
+
+export function defaultMakeId() {
+  return `toolu_${Math.random().toString(36).slice(2)}${Math.random()
+    .toString(36)
+    .slice(2)}`;
+}
+
+export function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function expandToolCallStart(text, callStart) {
+  let earliest = callStart;
+  for (const tag of ["<tool_call", "<function_calls"]) {
+    const tagStart = text.toLowerCase().lastIndexOf(tag, earliest);
+    if (tagStart < 0) continue;
+    const tagEnd = text.indexOf(">", tagStart);
+    if (tagEnd < 0 || tagEnd >= earliest) continue;
+    if (!text.slice(tagEnd + 1, earliest).trim()) earliest = tagStart;
+  }
+  return earliest;
 }
