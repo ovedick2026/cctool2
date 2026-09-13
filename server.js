@@ -19,7 +19,7 @@ setGlobalDispatcher(
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '20mb' }));
 
 const PORT = Number(process.env.PORT || 7860);
 const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
@@ -45,7 +45,7 @@ const logger = {
 };
 
 // ==========================================
-// 2. 动态 URL 穿透解析 & SSRF 防御
+// 2. 核心路由重写与安全穿透中间件 (修复 404 根源)
 // ==========================================
 function isPrivateOrRestrictedHost(hostname) {
   const lower = hostname.toLowerCase();
@@ -57,8 +57,9 @@ function isPrivateOrRestrictedHost(hostname) {
   return false;
 }
 
-function parseTargetUrl(req) {
-  let raw = req.originalUrl.startsWith('/') ? req.originalUrl.slice(1) : req.originalUrl;
+// 统一路径规范化：无论请求如何嵌套，一律重写为标准的 /v1/...
+app.use((req, res, next) => {
+  let raw = req.url.startsWith('/') ? req.url.slice(1) : req.url;
   if (!/^https?:\/\//i.test(raw)) {
     try { raw = decodeURIComponent(raw); } catch {}
   }
@@ -68,25 +69,26 @@ function parseTargetUrl(req) {
     try {
       const u = new URL(v1Match[1]);
       if (!isPrivateOrRestrictedHost(u.hostname)) {
-        return {
-          upstreamBase: v1Match[1],
-          endpoint: '/' + v1Match[2],
-          fullTarget: v1Match[1] + '/' + v1Match[2]
-        };
+        req.upstreamBase = v1Match[1];
+        req.url = '/' + v1Match[2] + (v1Match[3] ? '?' + v1Match[3] : '');
+        return next();
       }
     } catch {}
   }
 
-  const envBase = (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, '');
-  return {
-    upstreamBase: envBase,
-    endpoint: req.path,
-    fullTarget: envBase + req.path
-  };
-}
+  // 兜底环境变量配置
+  req.upstreamBase = (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, '');
+  
+  // 兼容直接访问 /v1/xxx
+  const directMatch = req.url.match(/(\/v1\/(?:messages|chat\/completions|models|messages\/count_tokens)(?:\?.*)?)$/i);
+  if (directMatch) {
+    req.url = directMatch[1];
+  }
+  next();
+});
 
 // ==========================================
-// 3. Action 与 CC 工具映射器
+// 3. 工具映射器
 // ==========================================
 function mapActionToClaudeCodeTool(actionName, rawParams) {
   const normAction = String(actionName || '').trim().toLowerCase();
@@ -187,18 +189,13 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 【核心增强】：以“推进价值”为导向的智能压缩引擎
+// 4. 智能历史处理与压缩
 // ==========================================
 const CORE_DOCS_REGEX = /(?:^|[/\s"'\`\\])(?:todo|readme)\.(?:md|markdown|txt)(?:[/\s"'\`\\]|$)/i;
 
 function sanitizeWhitespace(text) {
   if (!text || typeof text !== 'string') return '';
-  return text
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/[ \t]+$/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function cleanNoise(text) {
@@ -241,24 +238,19 @@ function smartTruncateLog(text, limit, label = '终端日志') {
   return `${headPart}${summary}${tailPart}`;
 }
 
-// 逐个工具分析信息增益价值，动态提炼
 function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, stepAge) {
   const normAction = (action || '').toLowerCase();
   let text = sanitizeWhitespace(String(rawFeedback || ''));
 
-  // -------------------------------------------------------------
-  // 1. 【用户决策】：user_prompt / AskUserQuestion (最高优先级！字字保留)
-  // -------------------------------------------------------------
+  // 1. 用户提问与选择决策（绝对完整保留）
   if (normAction === 'user_prompt' || normAction === 'askuserquestion') {
     return `【用户决策确认】:
 - 询问内容: ${params.question || JSON.stringify(params.questions || params)}
-- 用户明确输入/所选选项: ${text || '（用户未补充额外说明，已按默认提交）'}
+- 用户明确输入/所选选项: ${text || '（用户确认提交）'}
 【调度注意】：必须严格尊重上述用户的明确选择，继续推进下一步。`;
   }
 
-  // -------------------------------------------------------------
-  // 2. 【核心任务与文档】：todo.md / readme.md 检查清单
-  // -------------------------------------------------------------
+  // 2. 核心任务清单
   const cmdStr = String(params.command || params.cmd || '');
   const pathStr = String(params.file_path || params.path || '');
   const isTargetDocFile = CORE_DOCS_REGEX.test(pathStr) || CORE_DOCS_REGEX.test(cmdStr);
@@ -269,12 +261,8 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
     return smartTruncateLog(text, 25000, '核心任务/设计文档清单');
   }
 
-  // -------------------------------------------------------------
-  // 3. 【网络搜索与抓取】：net_search / net_fetch
-  // 价值：网页源码中大量 CSS/JS 毫无意义，仅需保留搜索结果总结和抓取正文
-  // -------------------------------------------------------------
+  // 3. 网络搜索与抓取
   if (normAction === 'net_search' || normAction === 'net_fetch' || normAction === 'websearch' || normAction === 'webfetch') {
-    // 移除 html 杂质
     const pureText = text.replace(/<script[\s\S]*?<\/script>/gi, '')
                          .replace(/<style[\s\S]*?<\/style>/gi, '')
                          .replace(/<[^>]+>/g, ' ')
@@ -283,33 +271,22 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
     return pureText.length > budget ? smartTruncateLog(pureText, budget, '网页/检索结果') : pureText;
   }
 
-  // -------------------------------------------------------------
-  // 4. 【任务编排】：task_entry / taskcreate / taskupdate
-  // 价值：清晰指示当前任务完成进度，便于模型全局把控
-  // -------------------------------------------------------------
+  // 4. 任务管理
   if (normAction === 'task_entry' || normAction === 'taskcreate' || normAction === 'taskupdate') {
     return `[任务管理同步] ${params.action === 'update' ? `更新任务[ID: ${params.taskId || params.task_id}]状态为: ${params.status || 'completed'}` : `创建任务: ${params.title || params.subject}`}。执行结果: ${text || '成功'}`;
   }
 
-  // -------------------------------------------------------------
-  // 5. 【工作区隔离】：git_worktree
-  // 价值：明确当前所在的物理执行路径
-  // -------------------------------------------------------------
+  // 5. 工作区
   if (normAction === 'git_worktree' || normAction === 'enterworktree') {
     return `[工作区切换] 当前已进入工作区路径: ${params.path || params.name || '默认'}。反馈: ${text}`;
   }
 
-  // -------------------------------------------------------------
-  // 6. 【代码审查与测试】：code_audit / notebook_patch
-  // 价值：保留发现的 Bug 列表和审查结论
-  // -------------------------------------------------------------
+  // 6. 代码审计
   if (normAction === 'code_audit' || normAction === 'reportfindings') {
     return text.length > 5000 ? smartTruncateLog(text, 5000, '审查报告与缺陷清单') : text;
   }
 
-  // -------------------------------------------------------------
-  // 7. 【普通终端命令输出】：shell_exec / Bash
-  // -------------------------------------------------------------
+  // 7. 命令输出
   if (normAction === 'shell_exec' || normAction === 'bash') {
     if (/successfully|done|created|installed/i.test(text) && !text.includes('error') && text.length > 2000 && !isLatestStep) {
       return `[SUCCESS] 终端命令执行完成，核心产物已就绪。\n` + text.slice(-400);
@@ -318,26 +295,20 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
     return text.length > budget ? smartTruncateLog(text, budget, '终端命令输出') : text;
   }
 
-  // -------------------------------------------------------------
-  // 8. 【普通文件读取】：fs_read / Read
-  // -------------------------------------------------------------
+  // 8. 文件读取
   if (normAction === 'fs_read' || normAction === 'read') {
     const budget = isLatestStep ? 12000 : (stepAge <= 2 ? 5000 : 2000);
     return text.length > budget ? smartTruncateLog(text, budget, '代码/文本读取') : text;
   }
 
-  // 默认兜底
   const defaultBudget = isLatestStep ? 8000 : 2000;
   return text.length > defaultBudget ? smartTruncateLog(text, defaultBudget, '执行反馈') : text;
 }
 
 function compressHistorySteps(rawSteps) {
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
-  // 保留最近 10 步，确保长链条任务具有完整的上下文记忆
   const trimmed = validSteps.slice(-10);
-  if (trimmed.length === 0) {
-    return '（当前为初始化阶段，尚无历史记录）';
-  }
+  if (trimmed.length === 0) return '（当前为初始化阶段，尚无历史记录）';
 
   const lastReadMap = new Map();
   trimmed.forEach((s, idx) => {
@@ -347,7 +318,6 @@ function compressHistorySteps(rawSteps) {
   });
 
   const total = trimmed.length;
-
   return trimmed.map((step, idx) => {
     let rawFeedback = step.feedback || '[SUCCESS] 执行完成';
     let params = { ...step.params };
@@ -358,7 +328,6 @@ function compressHistorySteps(rawSteps) {
     const stepAge = total - 1 - idx;
     const isLatestStep = stepAge === 0;
 
-    // fs_write 参数骨架化（保护源码，避免源码在 prompt 重复出现）
     if (step.action === 'fs_write') {
       if (isTodoFile) {
         params = { file_path: params.file_path || 'todo.md', content: step.params?.content || '' };
@@ -374,7 +343,6 @@ function compressHistorySteps(rawSteps) {
       }
     }
 
-    // 重复读取折叠
     if (step.action === 'fs_read') {
       const lowerPath = filePathStr.toLowerCase();
       if (lastReadMap.get(lowerPath) !== idx) {
@@ -392,11 +360,9 @@ ${smartFeedback}`;
   }).join('\n\n');
 }
 
-// 解析对话，确保用户的决策/回答精准匹配上一步的提问
 function parseConversation(messages = []) {
   let globalTask = '';
   const rawSteps = [];
-
   const CC_TO_ACTION_MAP = {
     Write: 'fs_write', Read: 'fs_read', Edit: 'fs_replace', Bash: 'shell_exec',
     WebSearch: 'net_search', WebFetch: 'net_fetch', AskUserQuestion: 'user_prompt',
@@ -405,7 +371,6 @@ function parseConversation(messages = []) {
     ReportFindings: 'code_audit'
   };
 
-  // 1. 提取全局任务
   for (const msg of messages) {
     if (msg.role === 'user') {
       let rawText = '';
@@ -422,39 +387,28 @@ function parseConversation(messages = []) {
   }
   if (!globalTask) globalTask = '推进当前工作目录下的任务。';
 
-  // 2. 状态机解析
   const pendingSteps = new Map();
   const sequentialQueue = [];
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-
     if (msg.role === 'assistant') {
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_use') {
-            const stepObj = {
-              id: p.id || '',
-              action: CC_TO_ACTION_MAP[p.name] || 'shell_exec',
-              params: p.input || {}
-            };
+            const stepObj = { id: p.id || '', action: CC_TO_ACTION_MAP[p.name] || 'shell_exec', params: p.input || {} };
             if (p.id) pendingSteps.set(p.id, stepObj);
             sequentialQueue.push(stepObj);
           }
         }
       }
-
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
           let params = {};
           try {
             params = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {});
           } catch {}
-          const stepObj = {
-            id: tc.id || '',
-            action: CC_TO_ACTION_MAP[tc.function?.name] || 'shell_exec',
-            params
-          };
+          const stepObj = { id: tc.id || '', action: CC_TO_ACTION_MAP[tc.function?.name] || 'shell_exec', params };
           if (tc.id) pendingSteps.set(tc.id, stepObj);
           sequentialQueue.push(stepObj);
         }
@@ -484,13 +438,10 @@ function parseConversation(messages = []) {
         const matchedStep = matchAndPopStep(msg.tool_call_id) || sequentialQueue.shift();
         if (matchedStep) rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
       } else if (typeof msg.content === 'string') {
-        // 处理用户普通的文本回复（包括对 AskUserQuestion 的文本确认）
         const text = cleanNoise(msg.content);
         if (text && !text.startsWith("Today's date is") && sequentialQueue.length > 0) {
           const matchedStep = sequentialQueue.shift();
-          if (matchedStep) {
-            rawSteps.push({ ...matchedStep, feedback: text });
-          }
+          if (matchedStep) rawSteps.push({ ...matchedStep, feedback: text });
         }
       }
     }
@@ -498,7 +449,6 @@ function parseConversation(messages = []) {
 
   const historyLogsText = compressHistorySteps(rawSteps);
   const latestTurnInput = rawSteps.length > 0 ? rawSteps[rawSteps.length - 1].feedback : '（初始启动任务）';
-
   return { globalTask, historyLogsText, latestTurnInput };
 }
 
@@ -533,7 +483,7 @@ function buildPrompt(globalTask, historyLogsText) {
 2. 拆解规范：无历史记录启动时，检查 todo.md 和 readme.md。若无，必须首步通过 fs_write 规划写入详细 todo.md。
 3. 单步原则：每个回复只能输出当前唯一步骤的配置，绝不可合并多个步骤。
 4. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
-5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n）。
+5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（换行必须使用 \\n 转义）。
 
 【强制返回格式模板示例】:
 【思考】: 说明当前步骤的意图与判断分析...
@@ -556,7 +506,7 @@ ${historyLogsText}
 }
 
 // ==========================================
-// 6. 安全容错 JSON 解析
+// 6. JSON 容错提取
 // ==========================================
 function safeParseJson(str) {
   if (!str) return null;
@@ -577,11 +527,7 @@ function safeParseJson(str) {
       }
       escaped = (c === '\\' && !escaped);
     }
-    try {
-      return JSON.parse(res);
-    } catch {
-      return null;
-    }
+    try { return JSON.parse(res); } catch { return null; }
   }
 }
 
@@ -664,7 +610,7 @@ function extractActionAndThought(rawText) {
 }
 
 // ==========================================
-// 7. 上游通信（支持 AbortSignal 级联取消与连接复用）
+// 7. 上游通信流
 // ==========================================
 async function* readSSE(response) {
   const reader = response.body.getReader();
@@ -790,11 +736,22 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
   return { text: fullText, thinking: thinkingText };
 }
 
+function isCompactionRequest(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const lastMsg = messages[messages.length - 1];
+  const content = typeof lastMsg.content === 'string' 
+    ? lastMsg.content 
+    : (Array.isArray(lastMsg.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
+  return /summary of the conversation so far|summarize the conversation|compact|create a detailed summary/i.test(content);
+}
+
 // ==========================================
-// 8. 辅助路由
+// 8. 精准路由监听 (彻底解决匹配不上问题)
 // ==========================================
-app.get('*/v1/models', async (req, res) => {
-  const { upstreamBase } = parseTargetUrl(req);
+
+// Models
+app.get('/v1/models', async (req, res) => {
+  const upstreamBase = req.upstreamBase;
   try {
     const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
     const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
@@ -813,27 +770,17 @@ app.get('*/v1/models', async (req, res) => {
   });
 });
 
-app.post('*/v1/messages/count_tokens', (req, res) => {
+// Count Tokens
+app.post('/v1/messages/count_tokens', (req, res) => {
   const bodyText = JSON.stringify(req.body || {});
   const estimatedTokens = Math.ceil(bodyText.length / 3.8);
   res.json({ input_tokens: estimatedTokens });
 });
 
-function isCompactionRequest(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return false;
-  const lastMsg = messages[messages.length - 1];
-  const content = typeof lastMsg.content === 'string' 
-    ? lastMsg.content 
-    : (Array.isArray(lastMsg.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
-  return /summary of the conversation so far|summarize the conversation|compact|create a detailed summary/i.test(content);
-}
-
-// ==========================================
-// 9. Claude Code 主路由: POST */v1/messages
-// ==========================================
-app.post('*/v1/messages', async (req, res) => {
+// Messages (Claude Code 主路由)
+app.post('/v1/messages', async (req, res) => {
   const startTime = Date.now();
-  const { upstreamBase } = parseTargetUrl(req);
+  const upstreamBase = req.upstreamBase;
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
   const { model, messages, stream } = req.body;
 
@@ -885,7 +832,7 @@ app.post('*/v1/messages', async (req, res) => {
 
   try {
     const prompt = isCompacting
-      ? `请对以下流水线历史提供紧凑的阶段性总结（包括已做决策、当前进度、下一步）：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`
+      ? `请对以下流水线历史提供紧凑的阶段性总结：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`
       : buildPrompt(globalTask, historyLogsText);
 
     const { text: assistantText } = await fetchUpstreamStream(
@@ -976,11 +923,9 @@ app.post('*/v1/messages', async (req, res) => {
   }
 });
 
-// ==========================================
-// 10. OpenAI 兼容通道: POST */v1/chat/completions
-// ==========================================
-app.post('*/v1/chat/completions', async (req, res) => {
-  const { upstreamBase } = parseTargetUrl(req);
+// Chat Completions
+app.post('/v1/chat/completions', async (req, res) => {
+  const upstreamBase = req.upstreamBase;
   const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
   const { model, messages, stream } = req.body;
 
@@ -1077,12 +1022,19 @@ app.post('*/v1/chat/completions', async (req, res) => {
   }
 });
 
+// 【关键诊断】：未匹配到的任何请求直接在终端红字打印出来，彻底告别静默失联
+app.use((req, res) => {
+  console.warn(`\x1b[33m[404 路由未命中]\x1b[0m 收到未处理请求: ${req.method} ${req.originalUrl}`);
+  res.status(404).json({ error: { message: `Route not found: ${req.method} ${req.originalUrl}` } });
+});
+
 process.on('uncaughtException', (err) => logger.error('UncaughtException', err.message));
 process.on('unhandledRejection', (err) => logger.error('UnhandledRejection', err));
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(` CC 中介已就绪 (端口: ${PORT})`);
+  console.log(` CC Web 智能中介（全局路径重写与智能压缩修复版）已就绪 (端口: ${PORT})`);
+  console.log(` 调试模式: ${IS_DEBUG ? '开启 (DEBUG=true)' : '关闭 (仅错误日志)'}`);
   console.log(`======================================================\n`);
 });
 
