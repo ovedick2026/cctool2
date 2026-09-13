@@ -7,29 +7,34 @@ import { Agent, setGlobalDispatcher } from 'undici';
 
 dotenv.config();
 
-// 1. 网络底座配置
+// 1. 网络底座配置：IPv4优先，undici 40分钟超长超时防断开
 dns.setDefaultResultOrder('ipv4first');
 setGlobalDispatcher(
   new Agent({
-    headersTimeout: 600000,
-    bodyTimeout: 600000,
-    connectTimeout: 30000
+    headersTimeout: 2400000,
+    bodyTimeout: 2400000,
+    connectTimeout: 120000
   })
 );
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '100mb' }));
 
 const PORT = Number(process.env.PORT || 7860);
+const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 
+// ==========================================
+// 1. 结构化增量日志
+// ==========================================
 function getTimestamp() {
   return new Date().toISOString().replace('T', ' ').substring(0, 19);
 }
 
 const logger = {
-  info: (stage, details = {}) => {
-    console.log(`\n\x1b[36m[${getTimestamp()}]\x1b[0m \x1b[32m【${stage}】\x1b[0m`);
+  debug: (stage, details = {}) => {
+    if (!IS_DEBUG) return;
+    console.log(`\n\x1b[36m[${getTimestamp()}]\x1b[0m \x1b[32m【流程: ${stage}】\x1b[0m`);
     for (const [k, v] of Object.entries(details)) {
       if (v !== undefined && v !== null) {
         const valStr = typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v);
@@ -42,52 +47,9 @@ const logger = {
   }
 };
 
-// ====================================================================
-// 0. 【核心救命修复】：优先响应平台健康探活（HEAD / GET / OPTIONS）
-// 必须放在所有中间件的最前面，防止被平台 SIGTERM 杀掉容器！
-// ====================================================================
-app.use((req, res, next) => {
-  const method = req.method.toUpperCase();
-  const rawUrl = req.originalUrl || req.url;
-
-  // 捕获所有根路径与健康探活（包括平台探活常用的 HEAD 方法）
-  if (rawUrl === '/' || rawUrl === '/v1' || rawUrl === '/v1/' || rawUrl.startsWith('/health')) {
-    if (method === 'HEAD' || method === 'GET' || method === 'OPTIONS') {
-      logger.info('平台探活握手成功 (防止SIGTERM)', { Method: method, URL: rawUrl });
-      return res.status(200).json({
-        status: 'ok',
-        service: 'claude-code-proxy-live',
-        time: getTimestamp()
-      });
-    }
-  }
-  next();
-});
-
-// 全局流量探针
-app.use((req, res, next) => {
-  logger.info('收到网络请求', {
-    Method: req.method,
-    OriginalUrl: req.originalUrl,
-    ClientIP: req.ip,
-    ContentType: req.headers['content-type']
-  });
-  next();
-});
-
 // ==========================================
 // 2. 动态 URL 穿透解析
 // ==========================================
-function isPrivateOrRestrictedHost(hostname) {
-  const lower = hostname.toLowerCase();
-  if (lower === 'localhost' || lower === '127.0.0.1' || lower === '::1') return true;
-  if (/^10\.\d+\.\d+\.\d+$/.test(lower)) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(lower)) return true;
-  if (/^192\.168\.\d+\.\d+$/.test(lower)) return true;
-  if (/^169\.254\.\d+\.\d+$/.test(lower)) return true;
-  return false;
-}
-
 function parseTargetUrl(req) {
   let raw = req.originalUrl.startsWith('/') ? req.originalUrl.slice(1) : req.originalUrl;
   if (!/^https?:\/\//i.test(raw)) {
@@ -96,28 +58,22 @@ function parseTargetUrl(req) {
 
   const v1Match = raw.match(/^(https?:\/\/[^\/]+(?:\/[^\/]+)*?)\/(v1\/(?:messages|chat\/completions|models|messages\/count_tokens))(?:\?(.*))?$/i);
   if (v1Match) {
-    try {
-      const u = new URL(v1Match[1]);
-      if (!isPrivateOrRestrictedHost(u.hostname)) {
-        return {
-          upstreamBase: v1Match[1].replace(/\/$/, ''),
-          endpoint: '/' + v1Match[2],
-          fullTarget: v1Match[1].replace(/\/$/, '') + '/' + v1Match[2]
-        };
-      }
-    } catch {}
+    return {
+      upstreamBase: v1Match[1],
+      endpoint: '/' + v1Match[2],
+      fullTarget: v1Match[1] + '/' + v1Match[2] + (v1Match[3] ? '?' + v1Match[3] : '')
+    };
   }
 
-  const envBase = (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, '');
   return {
-    upstreamBase: envBase,
+    upstreamBase: (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, ''),
     endpoint: req.path,
-    fullTarget: envBase + req.path
+    fullTarget: (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, '') + req.path
   };
 }
 
 // ==========================================
-// 3. 工具映射器
+// 3. Action 与 Claude Code 原生工具适配映射器
 // ==========================================
 function mapActionToClaudeCodeTool(actionName, rawParams) {
   const normAction = String(actionName || '').trim().toLowerCase();
@@ -132,6 +88,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
       }
     };
   }
+
   if (normAction === 'fs_read' || normAction === 'read') {
     return {
       name: 'Read',
@@ -142,6 +99,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
       }
     };
   }
+
   if (normAction === 'fs_replace' || normAction === 'edit') {
     return {
       name: 'Edit',
@@ -153,6 +111,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
       }
     };
   }
+
   if (normAction === 'shell_exec' || normAction === 'bash') {
     return {
       name: 'Bash',
@@ -162,6 +121,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
       }
     };
   }
+
   if (normAction === 'user_prompt' || normAction === 'askuserquestion') {
     let questions = [];
     if (Array.isArray(params.questions)) {
@@ -173,30 +133,54 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
         if (typeof opt === 'string') return { label: opt, description: opt };
         return { label: opt.label || '选项', description: opt.description || opt.label || '' };
       });
+
       questions = [{
         question: qText,
-        header: params.header || '决策确认',
+        header: params.header || '中介决策确认',
         multiSelect: Boolean(params.multiSelect),
         options: formattedOptions
       }];
     }
     return { name: 'AskUserQuestion', arguments: { questions } };
   }
+
   if (normAction === 'net_search' || normAction === 'websearch') {
     return { name: 'WebSearch', arguments: { query: params.query || '' } };
   }
+
   if (normAction === 'net_fetch' || normAction === 'webfetch') {
     return { name: 'WebFetch', arguments: { url: params.url || '', prompt: params.prompt || '提取关键内容' } };
   }
+
   if (normAction === 'subflow_spawn' || normAction === 'agent') {
-    return { name: 'Agent', arguments: { description: params.title || params.description || 'Sub-agent task', prompt: params.instructions || params.prompt || '' } };
+    return {
+      name: 'Agent',
+      arguments: {
+        description: params.title || params.description || 'Sub-agent task',
+        prompt: params.instructions || params.prompt || ''
+      }
+    };
   }
+
   if (normAction === 'task_entry' || normAction === 'taskcreate' || normAction === 'taskupdate') {
     if (params.action === 'update' || params.taskId) {
-      return { name: 'TaskUpdate', arguments: { taskId: params.taskId || params.task_id, status: params.status || 'completed' } };
+      return {
+        name: 'TaskUpdate',
+        arguments: {
+          taskId: params.taskId || params.task_id,
+          status: params.status || 'completed'
+        }
+      };
     }
-    return { name: 'TaskCreate', arguments: { subject: params.title || params.subject || '任务', description: params.description || '' } };
+    return {
+      name: 'TaskCreate',
+      arguments: {
+        subject: params.title || params.subject || '任务',
+        description: params.description || ''
+      }
+    };
   }
+
   if (normAction === 'notebook_patch' || normAction === 'notebookedit') {
     return {
       name: 'NotebookEdit',
@@ -208,18 +192,34 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
       }
     };
   }
+
   if (normAction === 'git_worktree' || normAction === 'enterworktree') {
-    return { name: 'EnterWorktree', arguments: { name: params.name || 'worktree', path: params.path || '' } };
+    return {
+      name: 'EnterWorktree',
+      arguments: {
+        name: params.name || 'worktree',
+        path: params.path || ''
+      }
+    };
   }
+
   if (normAction === 'code_audit' || normAction === 'reportfindings') {
-    return { name: 'ReportFindings', arguments: { findings: params.findings || [], level: params.level || 'medium' } };
+    return {
+      name: 'ReportFindings',
+      arguments: {
+        findings: params.findings || [],
+        level: params.level || 'medium'
+      }
+    };
   }
+
   return { name: 'Bash', arguments: params };
 }
 
 // ==========================================
-// 4. 智能历史压缩
+// 4. 对话历史解析与智能压缩引擎
 // ==========================================
+
 const CORE_DOCS_REGEX = /(?:^|[/\s"'\`\\])(?:todo|readme)\.(?:md|markdown|txt)(?:[/\s"'\`\\]|$)/i;
 
 function sanitizeWhitespace(text) {
@@ -244,16 +244,51 @@ function cleanNoise(text) {
   return sanitizeWhitespace(cleaned);
 }
 
+function stringifyUserContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(c => {
+      if (!c) return '';
+      if (typeof c === 'string') return c;
+      if (c.type === 'text') return c.text || '';
+      if (c.text) return c.text;
+      if (c.content && typeof c.content === 'string') return c.content;
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  if (content && typeof content === 'object') {
+    try { return JSON.stringify(content); } catch { return String(content); }
+  }
+  return '';
+}
+
 function smartTruncateLog(text, limit, label = '终端日志') {
-  if (text.length <= limit) return text;
-  const headSize = Math.max(400, Math.floor(limit * 0.35));
-  const tailSize = Math.max(500, Math.floor(limit * 0.45));
+  if (!text || text.length <= limit) return text || '';
+
+  const headSize = Math.max(500, Math.floor(limit * 0.35));
+  const tailSize = Math.max(600, Math.floor(limit * 0.45));
+
   const headPart = text.slice(0, headSize);
   const tailPart = text.slice(-tailSize);
   const middleContent = text.slice(headSize, -tailSize);
 
   const lines = middleContent.split('\n');
-  const errorIndicators = [/error/i, /exception/i, /fail/i, /traceback/i, /exit code\s*[1-9]/i, /cannot access/i, /no such file/i];
+  const errorIndicators = [
+    /error/i,
+    /exception/i,
+    /fail/i,
+    /failed/i,
+    /traceback/i,
+    /exit code\s*[1-9]/i,
+    /cannot access/i,
+    /no such file/i,
+    /permission denied/i,
+    /syntaxerror/i,
+    /typeerror/i,
+    /referenceerror/i,
+    /warning/i,
+    /deprecated/i
+  ];
   const capturedLines = [];
 
   for (let i = 0; i < lines.length && capturedLines.length < 25; i++) {
@@ -263,130 +298,424 @@ function smartTruncateLog(text, limit, label = '终端日志') {
   }
 
   const removed = text.length - headSize - tailSize;
-  let summary = `\n...[${label}中间折叠 ${removed} 字符`;
+  let summary = `\n...[${label}中间输出已折叠 ${removed} 字符`;
   if (capturedLines.length > 0) {
-    summary += `，提炼关键异常信号：\n${capturedLines.slice(0, 8).join('\n')}\n...折叠结束]...\n`;
+    summary += `，提取关键异常信号：\n${capturedLines.slice(0, 12).join('\n')}\n...折叠结束]...\n`;
   } else {
     summary += `]...\n`;
   }
+
   return `${headPart}${summary}${tailPart}`;
 }
 
-function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, stepAge) {
-  const normAction = (action || '').toLowerCase();
-  let text = sanitizeWhitespace(String(rawFeedback || ''));
+function extractImportantLines(text, maxLines = 40) {
+  if (!text) return '';
+  const lines = String(text).split('\n').map(x => x.trim()).filter(Boolean);
+  const regs = [
+    /error/i,
+    /exception/i,
+    /fail/i,
+    /failed/i,
+    /traceback/i,
+    /exit code\s*[1-9]/i,
+    /no such file/i,
+    /permission denied/i,
+    /success/i,
+    /created/i,
+    /updated/i,
+    /modified/i,
+    /deleted/i,
+    /passed/i,
+    /test/i,
+    /build/i,
+    /lint/i,
+    /warning/i,
+    /todo/i,
+    /done/i,
+    /completed/i
+  ];
+  const picked = lines.filter(line => regs.some(r => r.test(line)));
+  return picked.slice(0, maxLines).join('\n');
+}
 
-  if (normAction === 'user_prompt' || normAction === 'askuserquestion') {
-    return `【用户决策确认】:
-- 询问内容: ${params.question || JSON.stringify(params.questions || params)}
-- 用户明确输入/所选选项: ${text || '（用户未补充额外说明，已按默认提交）'}
-【调度注意】：必须严格尊重上述用户的明确选择，继续推进下一步。`;
-  }
+function summarizeParamsByAction(actionName, params = {}) {
+  const action = String(actionName || '').toLowerCase();
+  const p = { ...params };
 
-  const cmdStr = String(params.command || params.cmd || '');
-  const pathStr = String(params.file_path || params.path || '');
-  const isTargetDocFile = CORE_DOCS_REGEX.test(pathStr) || CORE_DOCS_REGEX.test(cmdStr);
-  const hasChecklistMarks = /- \[[ xX]\]/m.test(text);
+  if (action === 'fs_write') {
+    const filePath = p.file_path || p.path || 'file';
+    const content = String(p.content || '');
+    const isTodo = /(?:^|[/\\])todo\.(?:md|markdown|txt)$/i.test(filePath);
+    const isReadme = /(?:^|[/\\])readme\.(?:md|markdown|txt)$/i.test(filePath);
 
-  if (isTargetDocFile || hasChecklistMarks) {
-    if (text.length <= 25000) return text;
-    return smartTruncateLog(text, 25000, '核心任务/设计文档清单');
-  }
-
-  if (normAction === 'net_search' || normAction === 'net_fetch' || normAction === 'websearch' || normAction === 'webfetch') {
-    const pureText = text.replace(/<script[\s\S]*?<\/script>/gi, '')
-                         .replace(/<style[\s\S]*?<\/style>/gi, '')
-                         .replace(/<[^>]+>/g, ' ')
-                         .replace(/\s{2,}/g, ' ');
-    const budget = isLatestStep ? 4000 : 1500;
-    return pureText.length > budget ? smartTruncateLog(pureText, budget, '网页/检索结果') : pureText;
-  }
-
-  if (normAction === 'task_entry' || normAction === 'taskcreate' || normAction === 'taskupdate') {
-    return `[任务管理同步] ${params.action === 'update' ? `更新任务[ID: ${params.taskId || params.task_id}]状态为: ${params.status || 'completed'}` : `创建任务: ${params.title || params.subject}`}。执行结果: ${text || '成功'}`;
-  }
-
-  if (normAction === 'git_worktree' || normAction === 'enterworktree') {
-    return `[工作区切换] 当前已进入工作区路径: ${params.path || params.name || '默认'}。反馈: ${text}`;
-  }
-
-  if (normAction === 'code_audit' || normAction === 'reportfindings') {
-    return text.length > 5000 ? smartTruncateLog(text, 5000, '审查报告与缺陷清单') : text;
-  }
-
-  if (normAction === 'shell_exec' || normAction === 'bash') {
-    if (/successfully|done|created|installed/i.test(text) && !text.includes('error') && text.length > 2000 && !isLatestStep) {
-      return `[SUCCESS] 终端命令执行完成，核心产物已就绪。\n` + text.slice(-400);
+    if (isTodo) {
+      return { file_path: filePath, content };
     }
-    const budget = isLatestStep ? 12000 : (stepAge <= 2 ? 5000 : 2000);
-    return text.length > budget ? smartTruncateLog(text, budget, '终端命令输出') : text;
+
+    if (isReadme) {
+      return {
+        file_path: filePath,
+        content: content.length <= 6000 ? content : `[readme.md 已写入，共 ${content.length} 字符。摘要保留：]\n${smartTruncateLog(content, 6000, 'readme文档')}`
+      };
+    }
+
+    return {
+      file_path: filePath,
+      content_summary: `[已写入文件，共 ${content.length} 字符]`,
+      content_preview: content.length <= 1200 ? content : `${content.slice(0, 700)}\n...[源码中段省略]...\n${content.slice(-400)}`
+    };
   }
 
-  if (normAction === 'fs_read' || normAction === 'read') {
-    const budget = isLatestStep ? 12000 : (stepAge <= 2 ? 5000 : 2000);
-    return text.length > budget ? smartTruncateLog(text, budget, '代码/文本读取') : text;
+  if (action === 'fs_replace') {
+    const filePath = p.file_path || p.path || 'file';
+    const oldStr = String(p.old_string || '');
+    const newStr = String(p.new_string || '');
+    const isCore = /(?:^|[/\\])(?:todo|readme)\.(?:md|markdown|txt)$/i.test(filePath);
+
+    if (isCore) {
+      return {
+        ...p,
+        old_string: oldStr.length <= 3000 ? oldStr : smartTruncateLog(oldStr, 3000, '核心文档旧内容'),
+        new_string: newStr.length <= 6000 ? newStr : smartTruncateLog(newStr, 6000, '核心文档新内容')
+      };
+    }
+
+    return {
+      file_path: filePath,
+      old_string: oldStr.length <= 500 ? oldStr : `${oldStr.slice(0, 240)}...[略]...${oldStr.slice(-160)}`,
+      new_string: newStr.length <= 800 ? newStr : `${newStr.slice(0, 360)}...[略]...${newStr.slice(-240)}`,
+      replace_all: Boolean(p.replace_all)
+    };
   }
 
-  const defaultBudget = isLatestStep ? 8000 : 2000;
-  return text.length > defaultBudget ? smartTruncateLog(text, defaultBudget, '执行反馈') : text;
+  if (action === 'fs_read') {
+    return {
+      file_path: p.file_path || p.path || '',
+      ...(p.limit ? { limit: p.limit } : {}),
+      ...(p.offset ? { offset: p.offset } : {})
+    };
+  }
+
+  if (action === 'shell_exec') {
+    return {
+      command: p.command || p.cmd || '',
+      ...(p.description ? { description: p.description } : {})
+    };
+  }
+
+  if (action === 'user_prompt') {
+    return p;
+  }
+
+  if (action === 'net_search') {
+    return { query: p.query || '' };
+  }
+
+  if (action === 'net_fetch') {
+    return { url: p.url || '', prompt: p.prompt || '' };
+  }
+
+  if (action === 'subflow_spawn') {
+    return {
+      title: p.title || p.description || '',
+      instructions: p.instructions || p.prompt || ''
+    };
+  }
+
+  if (action === 'task_entry') {
+    return p;
+  }
+
+  if (action === 'notebook_patch') {
+    return {
+      notebook_path: p.notebook_path || '',
+      cell_id: p.cell_id || '',
+      edit_mode: p.edit_mode || 'replace',
+      new_source: String(p.new_source || '').length <= 1500
+        ? String(p.new_source || '')
+        : `${String(p.new_source || '').slice(0, 900)}\n...[notebook源码省略]...\n${String(p.new_source || '').slice(-400)}`
+    };
+  }
+
+  return p;
+}
+
+function classifyStepRetention(actionName, params = {}, feedback = '') {
+  const action = String(actionName || '').toLowerCase();
+  const fp = String(params.file_path || params.path || '');
+  const cmd = String(params.command || params.cmd || '');
+  const text = String(feedback || '');
+
+  const isTodo = /(?:^|[/\\])todo\.(?:md|markdown|txt)$/i.test(fp);
+  const isReadme = /(?:^|[/\\])readme\.(?:md|markdown|txt)$/i.test(fp);
+  const isCoreDoc = isTodo || isReadme || CORE_DOCS_REGEX.test(fp) || CORE_DOCS_REGEX.test(cmd);
+  const hasChecklist = /- \[[ xX]\]/m.test(text);
+  const hasError = /error|exception|failed|fail|traceback|exit code\s*[1-9]|permission denied|no such file/i.test(text);
+  const hasSuccessSignal = /success|created|updated|modified|written|completed|done|passed/i.test(text);
+
+  if (action === 'user_prompt') {
+    return {
+      tier: 'must_keep_full',
+      reason: '用户决策问答必须完整保留，避免后续推进丢失用户选择。'
+    };
+  }
+
+  if (isCoreDoc || hasChecklist) {
+    return {
+      tier: 'core_context',
+      reason: 'todo/readme/清单类核心项目状态必须高保真保留。'
+    };
+  }
+
+  if (action === 'fs_read') {
+    return {
+      tier: isCoreDoc ? 'core_context' : 'contextual',
+      reason: isCoreDoc ? '核心文档读取。' : '普通文件读取保留关键片段，避免重复上下文过大。'
+    };
+  }
+
+  if (action === 'fs_write' || action === 'fs_replace' || action === 'notebook_patch') {
+    return {
+      tier: 'project_progress',
+      reason: '文件变更会影响项目状态，保留路径、变更摘要与关键反馈。'
+    };
+  }
+
+  if (action === 'shell_exec') {
+    if (hasError) {
+      return {
+        tier: 'diagnostic',
+        reason: '命令失败/异常对下一步修复非常关键，保留错误上下文。'
+      };
+    }
+    if (/npm|pnpm|yarn|bun|pytest|test|lint|build|tsc|eslint|vitest|jest|mvn|gradle|go test|cargo test|python|node/i.test(cmd)) {
+      return {
+        tier: 'validation',
+        reason: '构建/测试/检查结果用于判断是否继续推进。'
+      };
+    }
+    if (/ls|dir|find|grep|rg|cat|tree|pwd|git status|git diff/i.test(cmd)) {
+      return {
+        tier: 'inspection',
+        reason: '环境探查命令保留结构与关键结果即可。'
+      };
+    }
+    return {
+      tier: 'light',
+      reason: hasSuccessSignal ? '普通成功命令只需保留摘要。' : '普通命令保留关键输出。'
+    };
+  }
+
+  if (action === 'net_search' || action === 'net_fetch') {
+    return {
+      tier: 'knowledge',
+      reason: '网络检索内容可能指导实现，保留结论、链接与关键事实。'
+    };
+  }
+
+  if (action === 'subflow_spawn') {
+    return {
+      tier: 'project_progress',
+      reason: '子任务结果可能包含实现建议与验收结论。'
+    };
+  }
+
+  if (action === 'task_entry') {
+    return {
+      tier: 'project_progress',
+      reason: '任务创建/更新属于项目推进状态。'
+    };
+  }
+
+  if (action === 'code_audit') {
+    return {
+      tier: 'diagnostic',
+      reason: '代码审计结果对修复和验收关键。'
+    };
+  }
+
+  return {
+    tier: 'light',
+    reason: '未知或低价值工具，保留摘要和异常信号。'
+  };
+}
+
+function formatLocalFeedback(str, actionName, stepParams = {}, isLatestStep = false, stepAge = 0) {
+  if (!str) return '[SUCCESS] 操作已执行完成';
+
+  let text = sanitizeWhitespace(String(str));
+  const retention = classifyStepRetention(actionName, stepParams, text);
+  const action = String(actionName || '').toLowerCase();
+
+  if (/successfully|created|updated|done|completed|written|modified/i.test(text) && !text.startsWith('[')) {
+    text = `[SUCCESS] ${text}`;
+  }
+
+  if (retention.tier === 'must_keep_full') {
+    return text.length <= 30000 ? text : smartTruncateLog(text, 30000, '用户问答结果');
+  }
+
+  if (retention.tier === 'core_context') {
+    return text.length <= 22000 ? text : smartTruncateLog(text, 22000, '核心任务/设计文档');
+  }
+
+  if (retention.tier === 'diagnostic') {
+    return text.length <= 18000 ? text : smartTruncateLog(text, 18000, '异常诊断日志');
+  }
+
+  if (retention.tier === 'validation') {
+    const budget = isLatestStep ? 14000 : stepAge <= 2 ? 8000 : 5000;
+    return text.length <= budget ? text : smartTruncateLog(text, budget, '构建/测试/校验输出');
+  }
+
+  if (retention.tier === 'knowledge') {
+    const budget = isLatestStep ? 12000 : stepAge <= 2 ? 7000 : 4500;
+    return text.length <= budget ? text : smartTruncateLog(text, budget, '网络知识结果');
+  }
+
+  if (retention.tier === 'project_progress') {
+    const budget = isLatestStep ? 12000 : stepAge <= 2 ? 7000 : 4000;
+    return text.length <= budget ? text : smartTruncateLog(text, budget, '项目变更反馈');
+  }
+
+  if (retention.tier === 'inspection') {
+    const important = extractImportantLines(text, 30);
+    const budget = isLatestStep ? 8000 : stepAge <= 2 ? 4000 : 2200;
+    if (text.length <= budget) return text;
+    if (important) {
+      return `${smartTruncateLog(text, budget, '环境探查输出')}\n\n【提取的关键行】:\n${important}`;
+    }
+    return smartTruncateLog(text, budget, '环境探查输出');
+  }
+
+  const budget = isLatestStep ? 6000 : stepAge <= 2 ? 3000 : 1600;
+  if (action === 'fs_write') {
+    return text.length <= 1800 ? text : smartTruncateLog(text, 1800, '写入反馈');
+  }
+  return text.length <= budget ? text : smartTruncateLog(text, budget, '低价值工具反馈');
+}
+
+function normalizeUserAnswerText(text) {
+  const cleaned = cleanNoise(text);
+  if (!cleaned) return '';
+  if (cleaned.startsWith("Today's date is")) return '';
+  if (/^\s*\{[\s\S]*\}\s*$/.test(cleaned) && cleaned.length > 5000) {
+    return smartTruncateLog(cleaned, 8000, '用户结构化回答');
+  }
+  return cleaned;
 }
 
 function compressHistorySteps(rawSteps) {
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
-  const trimmed = validSteps.slice(-10);
-  if (trimmed.length === 0) {
+
+  const mustKeepIndexes = new Set();
+
+  validSteps.forEach((s, idx) => {
+    const retention = classifyStepRetention(s.action, s.params || {}, s.feedback || '');
+    if (
+      retention.tier === 'must_keep_full' ||
+      retention.tier === 'core_context' ||
+      s.action === 'user_prompt'
+    ) {
+      mustKeepIndexes.add(idx);
+    }
+  });
+
+  const recentStart = Math.max(0, validSteps.length - 8);
+  for (let i = recentStart; i < validSteps.length; i++) {
+    mustKeepIndexes.add(i);
+  }
+
+  const importantActions = new Set([
+    'fs_write',
+    'fs_replace',
+    'notebook_patch',
+    'shell_exec',
+    'net_search',
+    'net_fetch',
+    'subflow_spawn',
+    'task_entry',
+    'code_audit'
+  ]);
+
+  validSteps.forEach((s, idx) => {
+    if (!importantActions.has(s.action)) return;
+    const feedback = String(s.feedback || '');
+    if (/error|exception|failed|fail|traceback|exit code\s*[1-9]|permission denied|no such file/i.test(feedback)) {
+      mustKeepIndexes.add(idx);
+    }
+  });
+
+  const selectedIndexes = [...mustKeepIndexes].sort((a, b) => a - b);
+  const maxHistorical = 14;
+  let indexesToRender = selectedIndexes;
+
+  if (selectedIndexes.length > maxHistorical) {
+    const must = selectedIndexes.filter(i => {
+      const s = validSteps[i];
+      const retention = classifyStepRetention(s.action, s.params || {}, s.feedback || '');
+      return retention.tier === 'must_keep_full' || retention.tier === 'core_context' || i >= recentStart;
+    });
+    const rest = selectedIndexes.filter(i => !must.includes(i));
+    indexesToRender = [...rest.slice(-(maxHistorical - must.length)), ...must].sort((a, b) => a - b);
+  }
+
+  if (indexesToRender.length === 0) {
     return '（当前为初始化阶段，尚无历史记录）';
   }
 
   const lastReadMap = new Map();
-  trimmed.forEach((s, idx) => {
+  indexesToRender.forEach((originalIdx, renderIdx) => {
+    const s = validSteps[originalIdx];
     if (s.action === 'fs_read' && s.params?.file_path) {
-      lastReadMap.set(String(s.params.file_path).toLowerCase(), idx);
+      lastReadMap.set(String(s.params.file_path).toLowerCase(), renderIdx);
     }
   });
 
-  const total = trimmed.length;
+  const omittedCount = validSteps.length - indexesToRender.length;
+  const total = indexesToRender.length;
 
-  return trimmed.map((step, idx) => {
-    let rawFeedback = step.feedback || '[SUCCESS] 执行完成';
-    let params = { ...step.params };
+  const rendered = indexesToRender.map((originalIdx, renderIdx) => {
+    const step = validSteps[originalIdx];
+    let feedback = step.feedback || '[SUCCESS] 执行完成';
+    let params = summarizeParamsByAction(step.action, step.params || {});
     const filePathStr = String(params.file_path || params.path || '');
+
     const isTodoFile = /(?:^|[/\\])todo\.(?:md|markdown|txt)$/i.test(filePathStr);
     const isReadmeFile = /(?:^|[/\\])readme\.(?:md|markdown|txt)$/i.test(filePathStr);
 
-    const stepAge = total - 1 - idx;
+    const stepAge = total - 1 - renderIdx;
     const isLatestStep = stepAge === 0;
-
-    if (step.action === 'fs_write') {
-      if (isTodoFile) {
-        params = { file_path: params.file_path || 'todo.md', content: step.params?.content || '' };
-      } else if (isReadmeFile) {
-        const contentStr = String(step.params?.content || '');
-        params = {
-          file_path: params.file_path || 'readme.md',
-          content: contentStr.length <= 4000 ? contentStr : `[项目规划与设计规范已写入，共 ${contentStr.length} 字符]`
-        };
-      } else {
-        const len = step.params?.content ? String(step.params.content).length : 0;
-        params = { file_path: params.file_path || 'file', ...(len > 0 ? { content: `[源码/文档内容已写入，共 ${len} 字符]` } : {}) };
-      }
-    }
+    const retention = classifyStepRetention(step.action, params, feedback);
 
     if (step.action === 'fs_read') {
       const lowerPath = filePathStr.toLowerCase();
-      if (lastReadMap.get(lowerPath) !== idx) {
-        rawFeedback = `[早期版本已读取，第 ${lastReadMap.get(lowerPath) + 1} 步有最新读取结果，此处折叠]`;
+      if (lastReadMap.get(lowerPath) !== renderIdx && !isTodoFile && !isReadmeFile) {
+        feedback = `[早期版本已读取，后续有同文件最新读取结果，此处折叠。文件：${filePathStr}]`;
+      } else {
+        feedback = formatLocalFeedback(feedback, 'fs_read', params, isLatestStep, stepAge);
       }
+    } else {
+      feedback = formatLocalFeedback(feedback, step.action, params, isLatestStep, stepAge);
     }
 
-    const smartFeedback = formatStepSmartFeedback(step.action, params, rawFeedback, isLatestStep, stepAge);
-
-    return `--- Step ${idx + 1} ---
+    return `--- Step ${renderIdx + 1} / 原始第 ${originalIdx + 1} 步 ---
+【保留级别】：${retention.tier}
+【保留原因】：${retention.reason}
 【执行配置】：
-${JSON.stringify({ action: step.action, params }, null, 2)}
-【本地执行反馈】：
-${smartFeedback}`;
+${JSON.stringify({
+  action: step.action,
+  params
+}, null, 2)}
+【本地执行反馈 / 用户回答】：
+${feedback}`;
   }).join('\n\n');
+
+  if (omittedCount > 0) {
+    return `【历史压缩说明】：原始共有 ${validSteps.length} 个工具/问答步骤，已智能保留 ${indexesToRender.length} 个关键步骤，折叠 ${omittedCount} 个低价值或过旧步骤；用户问答、todo/readme、错误、测试、文件变更均优先保留。\n\n${rendered}`;
+  }
+
+  return rendered;
 }
 
 function parseConversation(messages = []) {
@@ -394,86 +723,185 @@ function parseConversation(messages = []) {
   const rawSteps = [];
 
   const CC_TO_ACTION_MAP = {
-    Write: 'fs_write', Read: 'fs_read', Edit: 'fs_replace', Bash: 'shell_exec',
-    WebSearch: 'net_search', WebFetch: 'net_fetch', AskUserQuestion: 'user_prompt',
-    Agent: 'subflow_spawn', Workflow: 'subflow_spawn', TaskCreate: 'task_entry',
-    TaskUpdate: 'task_entry', NotebookEdit: 'notebook_patch', EnterWorktree: 'git_worktree',
+    Write: 'fs_write',
+    Read: 'fs_read',
+    Edit: 'fs_replace',
+    Bash: 'shell_exec',
+    WebSearch: 'net_search',
+    WebFetch: 'net_fetch',
+    AskUserQuestion: 'user_prompt',
+    Agent: 'subflow_spawn',
+    Workflow: 'subflow_spawn',
+    TaskCreate: 'task_entry',
+    TaskUpdate: 'task_entry',
+    NotebookEdit: 'notebook_patch',
+    EnterWorktree: 'git_worktree',
     ReportFindings: 'code_audit'
   };
 
   for (const msg of messages) {
     if (msg.role === 'user') {
-      let rawText = '';
-      if (typeof msg.content === 'string') rawText = msg.content;
-      else if (Array.isArray(msg.content)) {
-        rawText = msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-      }
+      const rawText = stringifyUserContent(msg.content);
       const clean = cleanNoise(rawText);
-      if (clean && !clean.startsWith('<tool_result') && !clean.includes("Today's date is") && !clean.startsWith('{') && clean.length > 5) {
+      if (
+        clean &&
+        !clean.startsWith('<tool_result') &&
+        !clean.includes("Today's date is") &&
+        !clean.startsWith('{') &&
+        !/^\s*(selected|answer|choice|option|确认|取消|yes|no)\s*[:：]/i.test(clean)
+      ) {
         globalTask = clean;
         break;
       }
     }
   }
-  if (!globalTask) globalTask = '推进当前工作目录下的任务。';
+  if (!globalTask) globalTask = '推进当前工作目录下的任务推进。';
 
   const pendingSteps = new Map();
   const sequentialQueue = [];
+  let awaitingUserAnswerStep = null;
+
+  const isLikelyUserAnswerToQuestion = (text) => {
+    const clean = normalizeUserAnswerText(text);
+    if (!clean) return false;
+    if (!awaitingUserAnswerStep) return false;
+    if (clean.startsWith('<tool_result')) return false;
+    if (clean.includes("Today's date is")) return false;
+    return true;
+  };
+
+  const matchAndPopStep = (toolCallId) => {
+    if (toolCallId && pendingSteps.has(toolCallId)) {
+      const step = pendingSteps.get(toolCallId);
+      pendingSteps.delete(toolCallId);
+      const qIdx = sequentialQueue.findIndex(s => s.id === toolCallId);
+      if (qIdx !== -1) sequentialQueue.splice(qIdx, 1);
+      return step;
+    }
+    return sequentialQueue.shift() || null;
+  };
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
+
     if (msg.role === 'assistant') {
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_use') {
-            const stepObj = { id: p.id || '', action: CC_TO_ACTION_MAP[p.name] || 'shell_exec', params: p.input || {} };
+            const mappedAction = CC_TO_ACTION_MAP[p.name] || 'shell_exec';
+            const stepObj = {
+              id: p.id || '',
+              action: mappedAction,
+              params: p.input || {}
+            };
             if (p.id) pendingSteps.set(p.id, stepObj);
             sequentialQueue.push(stepObj);
+            if (mappedAction === 'user_prompt') awaitingUserAnswerStep = stepObj;
           }
         }
       }
 
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
+          const fnName = tc.function?.name || '';
+          const mappedAction = CC_TO_ACTION_MAP[fnName] || 'shell_exec';
           let params = {};
           try {
-            params = typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {});
-          } catch {}
-          const stepObj = { id: tc.id || '', action: CC_TO_ACTION_MAP[tc.function?.name] || 'shell_exec', params };
+            params = typeof tc.function?.arguments === 'string'
+              ? JSON.parse(tc.function.arguments)
+              : (tc.function?.arguments || {});
+          } catch {
+            params = {};
+          }
+          const stepObj = {
+            id: tc.id || '',
+            action: mappedAction,
+            params
+          };
           if (tc.id) pendingSteps.set(tc.id, stepObj);
           sequentialQueue.push(stepObj);
+          if (mappedAction === 'user_prompt') awaitingUserAnswerStep = stepObj;
+        }
+      }
+
+      if (typeof msg.content === 'string' && msg.content.includes('<tool_call>')) {
+        const tcMatch = msg.content.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i);
+        if (tcMatch) {
+          try {
+            const parsed = JSON.parse(cleanLooseJson(tcMatch[1]));
+            if (parsed.name) {
+              const mappedAction = CC_TO_ACTION_MAP[parsed.name] || 'shell_exec';
+              const stepObj = {
+                id: '',
+                action: mappedAction,
+                params: parsed.arguments || {}
+              };
+              sequentialQueue.push(stepObj);
+              if (mappedAction === 'user_prompt') awaitingUserAnswerStep = stepObj;
+            }
+          } catch {}
         }
       }
     } else if (msg.role === 'user' || msg.role === 'tool') {
-      const matchAndPopStep = (toolCallId) => {
-        if (toolCallId && pendingSteps.has(toolCallId)) {
-          const step = pendingSteps.get(toolCallId);
-          pendingSteps.delete(toolCallId);
-          const qIdx = sequentialQueue.findIndex(s => s.id === toolCallId);
-          if (qIdx !== -1) sequentialQueue.splice(qIdx, 1);
-          return step;
-        }
-        return null;
-      };
-
       if (Array.isArray(msg.content)) {
         for (const p of msg.content) {
           if (p.type === 'tool_result') {
-            const outText = typeof p.content === 'string' ? p.content : (p.content?.map(c => c.text).join('\n') || '');
-            const matchedStep = matchAndPopStep(p.tool_use_id) || sequentialQueue.shift();
-            if (matchedStep) rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
+            const outText = typeof p.content === 'string'
+              ? p.content
+              : (Array.isArray(p.content) ? p.content.map(c => c.text || '').join('\n') : stringifyUserContent(p.content));
+            const matchedStep = matchAndPopStep(p.tool_use_id);
+            if (matchedStep) {
+              const cleanFeedback = cleanNoise(outText);
+              rawSteps.push({ ...matchedStep, feedback: cleanFeedback });
+              if (matchedStep.action === 'user_prompt') {
+                awaitingUserAnswerStep = null;
+              }
+            }
+          } else if (p.type === 'text') {
+            const answerText = normalizeUserAnswerText(p.text || '');
+            if (isLikelyUserAnswerToQuestion(answerText)) {
+              const idx = sequentialQueue.indexOf(awaitingUserAnswerStep);
+              if (idx !== -1) sequentialQueue.splice(idx, 1);
+              if (awaitingUserAnswerStep.id) pendingSteps.delete(awaitingUserAnswerStep.id);
+              rawSteps.push({
+                ...awaitingUserAnswerStep,
+                feedback: answerText,
+                user_answer: answerText
+              });
+              awaitingUserAnswerStep = null;
+            }
           }
         }
       } else if (msg.role === 'tool' && msg.tool_call_id) {
         const outText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        const matchedStep = matchAndPopStep(msg.tool_call_id) || sequentialQueue.shift();
-        if (matchedStep) rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
+        const matchedStep = matchAndPopStep(msg.tool_call_id);
+        if (matchedStep) {
+          rawSteps.push({ ...matchedStep, feedback: cleanNoise(outText) });
+          if (matchedStep.action === 'user_prompt') {
+            awaitingUserAnswerStep = null;
+          }
+        }
       } else if (typeof msg.content === 'string') {
         const text = cleanNoise(msg.content);
-        if (text && !text.startsWith("Today's date is") && sequentialQueue.length > 0) {
-          const matchedStep = sequentialQueue.shift();
+
+        if (isLikelyUserAnswerToQuestion(text)) {
+          const answerText = normalizeUserAnswerText(text);
+          const idx = sequentialQueue.indexOf(awaitingUserAnswerStep);
+          if (idx !== -1) sequentialQueue.splice(idx, 1);
+          if (awaitingUserAnswerStep.id) pendingSteps.delete(awaitingUserAnswerStep.id);
+          rawSteps.push({
+            ...awaitingUserAnswerStep,
+            feedback: answerText,
+            user_answer: answerText
+          });
+          awaitingUserAnswerStep = null;
+        } else if (text && !text.startsWith("Today's date is") && sequentialQueue.length > 0) {
+          const matchedStep = matchAndPopStep(null);
           if (matchedStep) {
             rawSteps.push({ ...matchedStep, feedback: text });
+            if (matchedStep.action === 'user_prompt') {
+              awaitingUserAnswerStep = null;
+            }
           }
         }
       }
@@ -482,14 +910,15 @@ function parseConversation(messages = []) {
 
   const historyLogsText = compressHistorySteps(rawSteps);
   const latestTurnInput = rawSteps.length > 0 ? rawSteps[rawSteps.length - 1].feedback : '（初始启动任务）';
+
   return { globalTask, historyLogsText, latestTurnInput };
 }
 
 // ==========================================
-// 5. Prompt 构建器
+// 5. 强化版抗风控 Prompt
 // ==========================================
 function buildPrompt(globalTask, historyLogsText) {
-  return `我们正在维护一个本地自动化流水线。该引擎按流水线逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出作为日志反馈给你。
+  return `我们正在维护一个本地自动化工作流引擎。该引擎按流水线（Pipeline）逐步执行任务。每个步骤由你根据历史日志输出一个独立的任务指令块，由外部执行脚本读取并在本地操作系统中执行，执行完毕后会将终端标准输出或用户回答作为日志反馈给你。
 
 【流水线可用指令库（Action Library）】：
 1. 文件与代码管理：
@@ -511,12 +940,14 @@ function buildPrompt(globalTask, historyLogsText) {
 5. 流程终结：
    - finish: {"summary": "全部流水线验收完成后的总结报告"}
 
-【流水线推进严律】：
-1. 用户意志绝对优先：若历史记录中包含【用户决策确认】，必须严格服从用户的选项继续推进，绝不可反复询问同一问题！
-2. 拆解规范：无历史记录启动时，检查 todo.md 和 readme.md。若无，必须首步通过 fs_write 规划写入详细 todo.md。
-3. 单步原则：每个回复只能输出当前唯一步骤的配置，绝不可合并多个步骤。
+【流水线设计约束】：
+1. 拆解规范：当工作流初次启动（无历史记录）时，先检查本地目录是否有 todo.md 和 readme.md 文件：
+- 若都有，检查相关内容是否与任务一致，一致则继续推进todo.md，不一致就算没有；
+- 只要有任何一个没有，第一个步骤必须对任务进行极细致的拆解（具体到单文件、单页面或单步骤），输出一个 action 为 "fs_write" 的配置，将任务项全为 [ ] 的 todo.md 写入本地，并将具体情况规划方案等写入本地 readme.md。
+2. 单步原则：每个回复只能输出当前唯一步骤的配置，不可合并多个步骤。
+3. 用户问答原则：历史记录里的 user_prompt 反馈代表用户真实选择/回答，必须严格继承，不得重复询问已回答的问题，除非答案无法执行。
 4. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
-5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（换行必须使用 \\n 转义）。
+5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n，不要打回车换行）。
 
 【强制返回格式模板示例】:
 【思考】: 说明当前步骤的意图与判断分析...
@@ -532,64 +963,68 @@ function buildPrompt(globalTask, historyLogsText) {
 【全局目标任务】：
 ${globalTask}
 =======================================================
-【历史执行记录（含用户明确决策与状态）】：
+【历史执行记录】：
 ${historyLogsText}
 =======================================================
-请结合上述上下文与用户意图，输出当前应执行的唯一步骤配置：`;
+【当前调度决策】：
+请综合【全局目标任务】与【历史执行记录】，评估当前阶段并输出下一步操作：
+- 若不清楚任务情况，读取本地 readme.md 内容。
+- 若尚未初始化，输出生成详尽 todo.md 的单一配置。
+- 若历史里有用户问答结果，必须按用户选择继续推进，不要丢失用户决策。
+- 若已有规划正在推进中，结合最新执行反馈输出下一步应执行的单一配置。
+- 若所有项已全部完成，输出 finish 配置。
+请输出当前步骤的配置：`;
 }
 
 // ==========================================
-// 6. 安全容错 JSON 解析
+// 6. 多模态容错提取与原生工具协议装配
 // ==========================================
 function safeParseJson(str) {
   if (!str) return null;
-  const clean = str.replace(/,\s*([}\]])/g, '$1').trim();
+  const clean = cleanLooseJson(str);
   try {
     return JSON.parse(clean);
-  } catch {
-    let inString = false;
-    let escaped = false;
-    let res = '';
-    for (let i = 0; i < clean.length; i++) {
-      const c = clean[i];
-      if (c === '"' && !escaped) inString = !inString;
-      if (inString && (c === '\n' || c === '\r')) {
-        res += c === '\n' ? '\\n' : '';
-      } else {
-        res += c;
-      }
-      escaped = (c === '\\' && !escaped);
-    }
+  } catch (e) {
     try {
-      return JSON.parse(res);
-    } catch {
+      const fixed = clean.replace(/:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_, p1) => {
+        return ': "' + p1.replace(/\r?\n/g, '\\n') + '"';
+      });
+      return JSON.parse(fixed);
+    } catch (e2) {
       return null;
     }
   }
 }
 
+function cleanLooseJson(str) {
+  return str.replace(/,\s*([}\]])/g, '$1').replace(/\r\n/g, '\n').trim();
+}
+
 function scanBalancedJsonObject(text) {
   let depth = 0;
   let inStr = false;
+  let quoteChar = '';
   let escape = false;
   let start = -1;
-
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (inStr) {
       if (escape) escape = false;
       else if (ch === '\\') escape = true;
-      else if (ch === '"') inStr = false;
+      else if (ch === quoteChar) inStr = false;
       continue;
     }
-    if (ch === '"') inStr = true;
-    else if (ch === '{') {
+    if (ch === '"' || ch === "'") {
+      inStr = true;
+      quoteChar = ch;
+    } else if (ch === '{') {
       if (depth === 0) start = i;
       depth++;
     } else if (ch === '}') {
       depth--;
       if (depth === 0 && start !== -1) {
-        const obj = safeParseJson(text.slice(start, i + 1));
+        const slice = text.slice(start, i + 1);
+        const obj = safeParseJson(slice);
         if (obj) return obj;
         start = -1;
       }
@@ -605,21 +1040,33 @@ function extractActionAndThought(rawText) {
   let params = {};
 
   const thoughtMatch = rawText.match(/【思考】[：:]\s*([\s\S]*?)(?=【调度动作】|```json|```|<tool_call>|$)/i);
-  if (thoughtMatch) thought = thoughtMatch[1].trim();
+  if (thoughtMatch) {
+    thought = thoughtMatch[1].trim();
+  }
 
   const actionMatch = rawText.match(/【调度动作】[：:]\s*([a-zA-Z0-9_]+)/i);
-  if (actionMatch) action = actionMatch[1].trim();
+  if (actionMatch) {
+    action = actionMatch[1].trim();
+  }
 
   const mdMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  let parsedJson = mdMatch ? safeParseJson(mdMatch[1]) : null;
-  if (!parsedJson) parsedJson = scanBalancedJsonObject(rawText);
+  let parsedJson = null;
+  if (mdMatch) {
+    parsedJson = safeParseJson(mdMatch[1]);
+  }
+  if (!parsedJson) {
+    parsedJson = scanBalancedJsonObject(rawText);
+  }
 
   if (parsedJson && typeof parsedJson === 'object') {
     if (parsedJson.action) {
       action = parsedJson.action;
       thought = parsedJson.step_thought || parsedJson.thought || thought;
       params = parsedJson.params || parsedJson.arguments || parsedJson;
-      delete params.action;
+      if (params.action) {
+        const { action: _a, step_thought: _st, thought: _t, ...rest } = params;
+        params = rest;
+      }
     } else if (action) {
       params = parsedJson;
     } else if (parsedJson.file_path && parsedJson.content !== undefined) {
@@ -637,7 +1084,9 @@ function extractActionAndThought(rawText) {
     }
   }
 
-  if (!thought && !action && !Object.keys(params).length) return null;
+  if (!thought && !action && !Object.keys(params).length) {
+    return null;
+  }
 
   return {
     thought: thought || '执行当前流水线步骤...',
@@ -647,7 +1096,7 @@ function extractActionAndThought(rawText) {
 }
 
 // ==========================================
-// 7. 上游通信
+// 7. 上游通信器
 // ==========================================
 async function* readSSE(response) {
   const reader = response.body.getReader();
@@ -678,27 +1127,18 @@ async function* readSSE(response) {
   }
 }
 
-async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
-  logger.info('准备向上游发起请求', {
-    目标Base: targetBase,
-    Model: model,
-    Key: apiKey ? apiKey.slice(0, 8) + '...' : '（无）',
-    Prompt长度: prompt.length
-  });
-
+async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinkingChunk) {
   const headers = {
     'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     'Authorization': `Bearer ${apiKey}`,
     'x-api-key': apiKey,
     'anthropic-version': '2023-06-01',
     'Accept': 'text/event-stream, application/json'
   };
 
-  // 1. Anthropic 通道尝试
   try {
-    const targetUrl = `${targetBase}/v1/messages`;
-    logger.info('尝试 Anthropic 通道', { URL: targetUrl });
-    const res = await fetch(targetUrl, {
+    const res = await fetch(`${targetBase}/v1/messages`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -706,12 +1146,10 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
         max_tokens: 8192,
         messages: [{ role: 'user', content: prompt }],
         stream: true
-      }),
-      signal
+      })
     });
 
     if (res.ok) {
-      logger.info('Anthropic 通道连接成功，开始读取 SSE 流');
       let fullText = '';
       let thinkingText = '';
       for await (const chunk of readSSE(res)) {
@@ -721,46 +1159,37 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
           if (payload.type === 'content_block_delta') {
             if (payload.delta?.type === 'thinking_delta' && payload.delta.thinking) {
               thinkingText += payload.delta.thinking;
+              if (onThinkingChunk) onThinkingChunk(payload.delta.thinking);
             } else if (payload.delta?.type === 'text_delta' && payload.delta.text) {
               fullText += payload.delta.text;
             }
           }
         } catch {}
       }
-      logger.info('Anthropic 通道流读取完毕', { 正文长度: fullText.length, 思考长度: thinkingText.length });
       return { text: fullText, thinking: thinkingText };
     }
+  } catch (e) {}
 
-    const errText = await res.text();
-    logger.info('Anthropic 通道未成功响应，降级尝试 OpenAI', { HTTP状态: res.status, 响应: errText.slice(0, 300) });
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    logger.error('Anthropic 通道异常', e.message);
-  }
-
-  // 2. OpenAI 降级通道
-  const chatUrl = `${targetBase}/v1/chat/completions`;
-  logger.info('尝试 OpenAI 通道', { URL: chatUrl });
-  const chatRes = await fetch(chatUrl, {
+  const chatRes = await fetch(`${targetBase}/v1/chat/completions`, {
     method: 'POST',
     headers,
     body: JSON.stringify({
       model: model || 'claude-3-7-sonnet-20250219',
       messages: [{ role: 'user', content: prompt }],
       stream: true
-    }),
-    signal
+    })
   });
 
   if (!chatRes.ok) {
     const errText = await chatRes.text();
-    logger.error('OpenAI 通道亦宣告失败', { HTTP状态: chatRes.status, 响应: errText });
-    throw new Error(`上游全部失败: HTTP ${chatRes.status} - ${errText}`);
+    throw new Error(`上游调用完全失败: HTTP ${chatRes.status} - ${errText}`);
   }
 
-  logger.info('OpenAI 通道握手成功，开始读取流');
   let fullText = '';
   let thinkingText = '';
+  let inThinkTag = false;
+  const tagOpen = '<' + 'think>';
+  const tagClose = '<' + '/think>';
 
   for await (const chunk of readSSE(chatRes)) {
     if (!chunk || chunk === '[DONE]') continue;
@@ -768,41 +1197,110 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
       const payload = JSON.parse(chunk);
       const delta = payload.choices?.[0]?.delta;
       if (delta) {
-        if (delta.reasoning_content || delta.reasoning) {
-          thinkingText += (delta.reasoning_content || delta.reasoning);
+        const think = delta.reasoning_content || delta.reasoning || '';
+        if (think) {
+          thinkingText += think;
+          if (onThinkingChunk) onThinkingChunk(think);
         }
+
         if (delta.content) {
-          fullText += delta.content;
+          let piece = delta.content;
+          while (piece.length > 0) {
+            if (!inThinkTag) {
+              const start = piece.indexOf(tagOpen);
+              if (start !== -1) {
+                fullText += piece.slice(0, start);
+                inThinkTag = true;
+                piece = piece.slice(start + tagOpen.length);
+              } else {
+                fullText += piece;
+                piece = '';
+              }
+            } else {
+              const end = piece.indexOf(tagClose);
+              if (end !== -1) {
+                const tPiece = piece.slice(0, end);
+                thinkingText += tPiece;
+                if (onThinkingChunk) onThinkingChunk(tPiece);
+                inThinkTag = false;
+                piece = piece.slice(end + tagClose.length);
+              } else {
+                thinkingText += piece;
+                if (onThinkingChunk) onThinkingChunk(piece);
+                piece = '';
+              }
+            }
+          }
         }
       }
     } catch {}
   }
-  logger.info('OpenAI 通道流读取完毕', { 正文长度: fullText.length });
   return { text: fullText, thinking: thinkingText };
 }
 
 // ==========================================
-// 8. Messages 处理管道
+// 8. 路由: /v1/models 与 /v1/messages/count_tokens
 // ==========================================
-async function handleMessages(req, res) {
+app.get(/(.*)\/v1\/models$/, async (req, res) => {
+  const { upstreamBase } = parseTargetUrl(req);
+  logger.debug('拉取模型列表', { 目标上游: upstreamBase });
+
+  try {
+    const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
+    const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
+      headers: {
+        'Authorization': authHeader,
+        'x-api-key': req.headers['x-api-key'] || ''
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (upstreamRes.ok) return res.json(await upstreamRes.json());
+  } catch (e) {}
+
+  res.json({
+    object: 'list',
+    data: [
+      { id: 'claude-3-7-sonnet-20250219', object: 'model' },
+      { id: 'claude-3-5-sonnet-20241022', object: 'model' }
+    ]
+  });
+});
+
+app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
+  const bodyText = JSON.stringify(req.body || {});
+  const rawTokens = Math.ceil(bodyText.length / 4);
+  const safeTokens = Math.min(rawTokens, 10000);
+  res.json({ input_tokens: safeTokens });
+});
+
+function isCompactionRequest(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const lastMsg = messages[messages.length - 1];
+  const content = typeof lastMsg.content === 'string'
+    ? lastMsg.content
+    : (Array.isArray(lastMsg.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
+  return /summary of the conversation so far|summarize the conversation|compact|create a detailed summary/i.test(content);
+}
+
+// ==========================================
+// 9. 核心路由: POST */v1/messages
+// ==========================================
+app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const startTime = Date.now();
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
-  const { model, messages, stream } = req.body || {};
+  const { model, messages, stream } = req.body;
 
-  logger.info('命中 Messages 处理管道', {
-    上游Base: upstreamBase,
-    Model: model,
-    Stream: Boolean(stream)
+  const isCompacting = isCompactionRequest(messages);
+  const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
+
+  logger.debug('收到 Claude Code 调度请求', {
+    '目标上游': upstreamBase,
+    '模型': model,
+    '压缩模式': isCompacting ? '是 (Compaction)' : '否',
+    '本次增量输入': latestTurnInput || '（初始启动任务）'
   });
 
-  const abortCtrl = new AbortController();
-  req.on('close', () => abortCtrl.abort());
-
-  const isCompacting = Boolean(Array.isArray(messages) && messages.length > 0 && 
-    /summary of the conversation|summarize|compact/i.test(JSON.stringify(messages[messages.length - 1])));
-
-  const { globalTask, historyLogsText } = parseConversation(messages || []);
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
   let heartbeatTimer = null;
   let blockIndex = 0;
@@ -816,7 +1314,6 @@ async function handleMessages(req, res) {
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
-
     sendSSE('message_start', {
       type: 'message_start',
       message: {
@@ -830,23 +1327,27 @@ async function handleMessages(req, res) {
         usage: { input_tokens: 150, output_tokens: 0 }
       }
     });
-
     heartbeatTimer = setInterval(() => {
       if (!res.writableEnded) res.write(': keep-alive\n\n');
     }, 5000);
   }
 
   try {
-    const prompt = isCompacting
-      ? `请对以下流水线历史提供紧凑的阶段性总结：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`
-      : buildPrompt(globalTask, historyLogsText);
+    let prompt = '';
+    if (isCompacting) {
+      prompt = `请对以下任务流水线当前的历史进展提供一份结构化、简明扼要的摘要总结，包括：已完成的步骤、生成/修改的文件清单、关键错误/测试结果、用户问答选择、以及当前待推进的下一个阶段。注意：用户问答选择必须完整保留，不得改写含义。请直接给出总结文本：\n\n【全局任务】：${globalTask}\n\n【执行历史】：\n${historyLogsText}`;
+    } else {
+      prompt = buildPrompt(globalTask, historyLogsText);
+    }
+
+    const onThinkingChunk = null;
 
     const { text: assistantText } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
       prompt,
-      abortCtrl.signal
+      onThinkingChunk
     );
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -856,15 +1357,15 @@ async function handleMessages(req, res) {
     let toolBlock = null;
 
     if (isCompacting) {
-      textContent = assistantText.replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '').trim() || '流水线历史已压缩。';
+      textContent = assistantText.replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '').trim() || '流水线历史状态已压缩归纳。';
       stopReason = 'end_turn';
     } else {
       const parsedAction = extractActionAndThought(assistantText);
-      logger.info('模型输出提取结果', { parsedAction });
 
       if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
         const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
         stopReason = 'tool_use';
+
         const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
         textContent = `调度 ${mappedTool.name} ${targetDesc ? '-> ' + targetDesc : ''}`.slice(0, 80);
 
@@ -874,6 +1375,12 @@ async function handleMessages(req, res) {
           name: mappedTool.name,
           input: mappedTool.arguments
         };
+
+        logger.debug('成功装配 CC 原生工具调用', {
+          '耗时': `${Date.now() - startTime}ms`,
+          '下发原生工具': mappedTool.name,
+          '参数大小': `${JSON.stringify(mappedTool.arguments).length} 字符`
+        });
       } else {
         textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
         stopReason = 'end_turn';
@@ -882,9 +1389,20 @@ async function handleMessages(req, res) {
 
     if (stream) {
       if (textContent) {
-        sendSSE('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
-        sendSSE('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: textContent } });
-        sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+        sendSSE('content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: { type: 'text', text: '' }
+        });
+        sendSSE('content_block_delta', {
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: { type: 'text_delta', text: textContent }
+        });
+        sendSSE('content_block_stop', {
+          type: 'content_block_stop',
+          index: blockIndex
+        });
         blockIndex++;
       }
 
@@ -892,21 +1410,38 @@ async function handleMessages(req, res) {
         sendSSE('content_block_start', {
           type: 'content_block_start',
           index: blockIndex,
-          content_block: { type: 'tool_use', id: toolBlock.id, name: toolBlock.name, input: {} }
+          content_block: {
+            type: 'tool_use',
+            id: toolBlock.id,
+            name: toolBlock.name,
+            input: {}
+          }
         });
         sendSSE('content_block_delta', {
           type: 'content_block_delta',
           index: blockIndex,
-          delta: { type: 'input_json_delta', partial_json: JSON.stringify(toolBlock.input) }
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify(toolBlock.input)
+          }
         });
-        sendSSE('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+        sendSSE('content_block_stop', {
+          type: 'content_block_stop',
+          index: blockIndex
+        });
         blockIndex++;
       }
 
-      sendSSE('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 300 } });
+      sendSSE('message_delta', {
+        type: 'message_delta',
+        delta: {
+          stop_reason: stopReason,
+          stop_sequence: null
+        },
+        usage: { output_tokens: 300 }
+      });
       sendSSE('message_stop', { type: 'message_stop' });
       res.end();
-      logger.info('SSE 流发送完成', { 耗时: `${Date.now() - startTime}ms` });
     } else {
       const content = [];
       if (textContent) content.push({ type: 'text', text: textContent });
@@ -925,34 +1460,27 @@ async function handleMessages(req, res) {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    if (err.name === 'AbortError') return;
     logger.error('Claude Code 消息通道异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
-}
+});
 
 // ==========================================
-// 9. Chat Completions 处理管道
+// 10. OpenWebUI / OpenAI 兼容通道
 // ==========================================
-async function handleChatCompletions(req, res) {
-  const startTime = Date.now();
+app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
   const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
-  const { model, messages, stream } = req.body || {};
+  const { model, messages, stream } = req.body;
+  const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
-  logger.info('命中 ChatCompletions 处理管道', {
-    上游Base: upstreamBase,
-    Model: model,
-    Stream: Boolean(stream)
+  logger.debug('收到 OpenAI/ChatCompletions 调度请求', {
+    目标上游: upstreamBase,
+    本次增量输入: latestTurnInput || '（初始启动任务）'
   });
 
-  const abortCtrl = new AbortController();
-  req.on('close', () => abortCtrl.abort());
-
-  const { globalTask, historyLogsText } = parseConversation(messages || []);
   let heartbeatTimer = null;
-
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -970,13 +1498,12 @@ async function handleChatCompletions(req, res) {
       apiKey,
       model,
       prompt,
-      abortCtrl.signal
+      null
     );
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
 
     const parsedAction = extractActionAndThought(assistantText);
-    const completionId = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
     const callId = 'call_' + crypto.randomBytes(8).toString('hex');
     let toolCalls = null;
     let finishReason = 'stop';
@@ -1001,23 +1528,44 @@ async function handleChatCompletions(req, res) {
     }
 
     if (stream) {
-      res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { role: 'assistant' }, index: 0 }] })}\n\n`);
-
-      if (textContent || thinking) {
-        res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { content: textContent, reasoning_content: thinking }, index: 0 }] })}\n\n`);
+      if (textContent) {
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-1',
+          choices: [{
+            delta: {
+              content: textContent,
+              reasoning_content: thinking
+            },
+            index: 0
+          }]
+        })}\n\n`);
       }
 
       if (toolCalls) {
-        res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { tool_calls: toolCalls }, index: 0 }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-1',
+          choices: [{
+            delta: {
+              tool_calls: toolCalls
+            },
+            index: 0
+          }]
+        })}\n\n`);
       }
 
-      res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: {}, finish_reason: finishReason, index: 0 }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        id: 'chatcmpl-1',
+        choices: [{
+          delta: {},
+          finish_reason: finishReason,
+          index: 0
+        }]
+      })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
-      logger.info('ChatCompletions SSE 发送完毕', { 耗时: `${Date.now() - startTime}ms` });
     } else {
       res.json({
-        id: completionId,
+        id: 'chatcmpl-' + crypto.randomBytes(8).toString('hex'),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
@@ -1034,93 +1582,18 @@ async function handleChatCompletions(req, res) {
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    if (err.name === 'AbortError') return;
-    logger.error('ChatCompletions 通道异常', err.message);
+    logger.error('ChatCompletions 消息通道异常', err.message);
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
-}
-
-// ==========================================
-// 10. 智能路由分发中心
-// ==========================================
-app.use((req, res, next) => {
-  const url = req.originalUrl || req.url;
-
-  // 1. Models 路由
-  if (req.method === 'GET' && /\/v1\/models(?:\?.*)?$/i.test(url)) {
-    const { upstreamBase } = parseTargetUrl(req);
-    logger.info('响应 Models 请求', { upstreamBase });
-    return (async () => {
-      try {
-        const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
-        const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
-          headers: { 'Authorization': authHeader, 'x-api-key': req.headers['x-api-key'] || '' },
-          signal: AbortSignal.timeout(8000)
-        });
-        if (upstreamRes.ok) return res.json(await upstreamRes.json());
-      } catch {}
-      res.json({
-        object: 'list',
-        data: [
-          { id: 'claude-3-7-sonnet-20250219', object: 'model' },
-          { id: 'claude-3-5-sonnet-20241022', object: 'model' }
-        ]
-      });
-    })();
-  }
-
-  // 2. Token 计数路由
-  if (req.method === 'POST' && /\/v1\/messages\/count_tokens(?:\?.*)?$/i.test(url)) {
-    logger.info('响应 Count Tokens 请求');
-    const bodyText = JSON.stringify(req.body || {});
-    const estimatedTokens = Math.ceil(bodyText.length / 3.8);
-    return res.json({ input_tokens: estimatedTokens });
-  }
-
-  // 3. Claude Code /v1/messages 核心通道
-  if (req.method === 'POST' && /\/v1\/messages(?:\?.*)?$/i.test(url)) {
-    return handleMessages(req, res);
-  }
-
-  // 4. OpenAI 兼容 /v1/chat/completions 通道
-  if (req.method === 'POST' && /\/v1\/chat\/completions(?:\?.*)?$/i.test(url)) {
-    return handleChatCompletions(req, res);
-  }
-
-  next();
 });
-
-// 404 兜底告警探针
-app.use((req, res) => {
-  logger.error('未匹配到任何内部路由！(404)', {
-    Method: req.method,
-    URL: req.originalUrl
-  });
-  res.status(404).json({
-    error: {
-      message: `中介未找到对应路由: ${req.method} ${req.originalUrl}`
-    }
-  });
-});
-
-// 系统异常与退出信号拦截
-process.on('SIGTERM', () => {
-  logger.info('收到系统 SIGTERM 信号，准备平滑关闭服务...');
-  server.close(() => {
-    process.exit(0);
-  });
-});
-
-process.on('uncaughtException', (err) => logger.error('UncaughtException', err.message));
-process.on('unhandledRejection', (err) => logger.error('UnhandledRejection', err));
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(` 🚀 CC 中介已就绪 (端口: ${PORT})`);
+  console.log(` CC 已就绪 (端口: ${PORT})`);
   console.log(`======================================================\n`);
 });
 
-server.requestTimeout = 600000;
-server.headersTimeout = 600000;
-server.keepAliveTimeout = 60000;
+server.requestTimeout = 2400000;
+server.headersTimeout = 2400000;
+server.keepAliveTimeout = 120000;
