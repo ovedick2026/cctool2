@@ -42,13 +42,35 @@ const logger = {
   }
 };
 
+// ====================================================================
+// 0. 【核心救命修复】：优先响应平台健康探活（HEAD / GET / OPTIONS）
+// 必须放在所有中间件的最前面，防止被平台 SIGTERM 杀掉容器！
+// ====================================================================
+app.use((req, res, next) => {
+  const method = req.method.toUpperCase();
+  const rawUrl = req.originalUrl || req.url;
+
+  // 捕获所有根路径与健康探活（包括平台探活常用的 HEAD 方法）
+  if (rawUrl === '/' || rawUrl === '/v1' || rawUrl === '/v1/' || rawUrl.startsWith('/health')) {
+    if (method === 'HEAD' || method === 'GET' || method === 'OPTIONS') {
+      logger.info('平台探活握手成功 (防止SIGTERM)', { Method: method, URL: rawUrl });
+      return res.status(200).json({
+        status: 'ok',
+        service: 'claude-code-proxy-live',
+        time: getTimestamp()
+      });
+    }
+  }
+  next();
+});
+
 // 全局流量探针
 app.use((req, res, next) => {
   logger.info('收到网络请求', {
-    'Method': req.method,
-    'OriginalUrl': req.originalUrl,
-    'Client-IP': req.ip,
-    'Content-Type': req.headers['content-type']
+    Method: req.method,
+    OriginalUrl: req.originalUrl,
+    ClientIP: req.ip,
+    ContentType: req.headers['content-type']
   });
   next();
 });
@@ -72,7 +94,6 @@ function parseTargetUrl(req) {
     try { raw = decodeURIComponent(raw); } catch {}
   }
 
-  // 匹配类似 https://xxx.space/v1/chat/completions 或 https://xxx.space/v1/messages
   const v1Match = raw.match(/^(https?:\/\/[^\/]+(?:\/[^\/]+)*?)\/(v1\/(?:messages|chat\/completions|models|messages\/count_tokens))(?:\?(.*))?$/i);
   if (v1Match) {
     try {
@@ -96,7 +117,7 @@ function parseTargetUrl(req) {
 }
 
 // ==========================================
-// 3. Action 与 CC 工具映射器
+// 3. 工具映射器
 // ==========================================
 function mapActionToClaudeCodeTool(actionName, rawParams) {
   const normAction = String(actionName || '').trim().toLowerCase();
@@ -626,7 +647,7 @@ function extractActionAndThought(rawText) {
 }
 
 // ==========================================
-// 7. 上游通信（详细打印网络与报错细节）
+// 7. 上游通信
 // ==========================================
 async function* readSSE(response) {
   const reader = response.body.getReader();
@@ -659,10 +680,10 @@ async function* readSSE(response) {
 
 async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
   logger.info('准备向上游发起请求', {
-    '目标Base': targetBase,
-    'Model': model,
-    'API-Key前缀': apiKey ? apiKey.slice(0, 8) + '...' : '（无）',
-    'Prompt长度': prompt.length
+    目标Base: targetBase,
+    Model: model,
+    Key: apiKey ? apiKey.slice(0, 8) + '...' : '（无）',
+    Prompt长度: prompt.length
   });
 
   const headers = {
@@ -761,7 +782,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
 }
 
 // ==========================================
-// 8. Messages 处理管道 (Claude Code 原生)
+// 8. Messages 处理管道
 // ==========================================
 async function handleMessages(req, res) {
   const startTime = Date.now();
@@ -770,17 +791,13 @@ async function handleMessages(req, res) {
   const { model, messages, stream } = req.body || {};
 
   logger.info('命中 Messages 处理管道', {
-    '解析上游Base': upstreamBase,
-    'Model': model,
-    'Messages轮数': Array.isArray(messages) ? messages.length : 0,
-    'Stream模式': Boolean(stream)
+    上游Base: upstreamBase,
+    Model: model,
+    Stream: Boolean(stream)
   });
 
   const abortCtrl = new AbortController();
-  req.on('close', () => {
-    logger.info('客户端提前断开连接');
-    abortCtrl.abort();
-  });
+  req.on('close', () => abortCtrl.abort());
 
   const isCompacting = Boolean(Array.isArray(messages) && messages.length > 0 && 
     /summary of the conversation|summarize|compact/i.test(JSON.stringify(messages[messages.length - 1])));
@@ -916,7 +933,7 @@ async function handleMessages(req, res) {
 }
 
 // ==========================================
-// 9. 【关键补齐】：Chat Completions 处理管道 (OpenAI 协议)
+// 9. Chat Completions 处理管道
 // ==========================================
 async function handleChatCompletions(req, res) {
   const startTime = Date.now();
@@ -925,16 +942,13 @@ async function handleChatCompletions(req, res) {
   const { model, messages, stream } = req.body || {};
 
   logger.info('命中 ChatCompletions 处理管道', {
-    '解析上游Base': upstreamBase,
-    'Model': model,
-    'Stream模式': Boolean(stream)
+    上游Base: upstreamBase,
+    Model: model,
+    Stream: Boolean(stream)
   });
 
   const abortCtrl = new AbortController();
-  req.on('close', () => {
-    logger.info('客户端提前断开连接');
-    abortCtrl.abort();
-  });
+  req.on('close', () => abortCtrl.abort());
 
   const { globalTask, historyLogsText } = parseConversation(messages || []);
   let heartbeatTimer = null;
@@ -1031,19 +1045,9 @@ async function handleChatCompletions(req, res) {
 // 10. 智能路由分发中心
 // ==========================================
 app.use((req, res, next) => {
-  const url = req.originalUrl;
+  const url = req.originalUrl || req.url;
 
-  // 1. 响应根路径与健康探活
-  if (req.method === 'GET' && (url === '/' || url === '/v1' || url === '/v1/' || url.startsWith('/health'))) {
-    logger.info('响应根路径/健康探活', { URL: url });
-    return res.status(200).json({
-      status: 'ok',
-      message: 'Claude Code Agent Proxy is running',
-      version: '1.0.0'
-    });
-  }
-
-  // 2. Models 路由
+  // 1. Models 路由
   if (req.method === 'GET' && /\/v1\/models(?:\?.*)?$/i.test(url)) {
     const { upstreamBase } = parseTargetUrl(req);
     logger.info('响应 Models 请求', { upstreamBase });
@@ -1066,7 +1070,7 @@ app.use((req, res, next) => {
     })();
   }
 
-  // 3. Token 计数路由
+  // 2. Token 计数路由
   if (req.method === 'POST' && /\/v1\/messages\/count_tokens(?:\?.*)?$/i.test(url)) {
     logger.info('响应 Count Tokens 请求');
     const bodyText = JSON.stringify(req.body || {});
@@ -1074,17 +1078,16 @@ app.use((req, res, next) => {
     return res.json({ input_tokens: estimatedTokens });
   }
 
-  // 4. Claude Code /v1/messages 核心通道
+  // 3. Claude Code /v1/messages 核心通道
   if (req.method === 'POST' && /\/v1\/messages(?:\?.*)?$/i.test(url)) {
     return handleMessages(req, res);
   }
 
-  // 5. 【核心接入】：OpenAI 兼容 /v1/chat/completions 通道
+  // 4. OpenAI 兼容 /v1/chat/completions 通道
   if (req.method === 'POST' && /\/v1\/chat\/completions(?:\?.*)?$/i.test(url)) {
     return handleChatCompletions(req, res);
   }
 
-  // 6. 未匹配路由兜底
   next();
 });
 
@@ -1092,8 +1095,7 @@ app.use((req, res, next) => {
 app.use((req, res) => {
   logger.error('未匹配到任何内部路由！(404)', {
     Method: req.method,
-    URL: req.originalUrl,
-    提示: '请检查请求 URL 是否带有非标准的 /v1 路径'
+    URL: req.originalUrl
   });
   res.status(404).json({
     error: {
@@ -1102,14 +1104,20 @@ app.use((req, res) => {
   });
 });
 
+// 系统异常与退出信号拦截
+process.on('SIGTERM', () => {
+  logger.info('收到系统 SIGTERM 信号，准备平滑关闭服务...');
+  server.close(() => {
+    process.exit(0);
+  });
+});
+
 process.on('uncaughtException', (err) => logger.error('UncaughtException', err.message));
 process.on('unhandledRejection', (err) => logger.error('UnhandledRejection', err));
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(` 🚀 CC Web 全链路可视化智能中介已就绪 (端口: ${PORT})`);
-  console.log(` 支持: /v1/messages (Claude) 以及 /v1/chat/completions (OpenAI)`);
-  console.log(` 支持: URL 前缀动态穿透 (/https://xxx/v1/...)`);
+  console.log(` 🚀 CC 中介已就绪 (端口: ${PORT})`);
   console.log(`======================================================\n`);
 });
 
