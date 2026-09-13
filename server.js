@@ -42,9 +42,7 @@ const logger = {
   }
 };
 
-// ==========================================
-// 全局流量探针（绝对不会静默）
-// ==========================================
+// 全局流量探针
 app.use((req, res, next) => {
   logger.info('收到网络请求', {
     'Method': req.method,
@@ -56,7 +54,7 @@ app.use((req, res, next) => {
 });
 
 // ==========================================
-// 2. 动态 URL 穿透解析 & SSRF 防御
+// 2. 动态 URL 穿透解析
 // ==========================================
 function isPrivateOrRestrictedHost(hostname) {
   const lower = hostname.toLowerCase();
@@ -74,15 +72,16 @@ function parseTargetUrl(req) {
     try { raw = decodeURIComponent(raw); } catch {}
   }
 
+  // 匹配类似 https://xxx.space/v1/chat/completions 或 https://xxx.space/v1/messages
   const v1Match = raw.match(/^(https?:\/\/[^\/]+(?:\/[^\/]+)*?)\/(v1\/(?:messages|chat\/completions|models|messages\/count_tokens))(?:\?(.*))?$/i);
   if (v1Match) {
     try {
       const u = new URL(v1Match[1]);
       if (!isPrivateOrRestrictedHost(u.hostname)) {
         return {
-          upstreamBase: v1Match[1],
+          upstreamBase: v1Match[1].replace(/\/$/, ''),
           endpoint: '/' + v1Match[2],
-          fullTarget: v1Match[1] + '/' + v1Match[2]
+          fullTarget: v1Match[1].replace(/\/$/, '') + '/' + v1Match[2]
         };
       }
     } catch {}
@@ -198,7 +197,7 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 智能语义历史压缩
+// 4. 智能历史压缩
 // ==========================================
 const CORE_DOCS_REGEX = /(?:^|[/\s"'\`\\])(?:todo|readme)\.(?:md|markdown|txt)(?:[/\s"'\`\\]|$)/i;
 
@@ -256,7 +255,6 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
   const normAction = (action || '').toLowerCase();
   let text = sanitizeWhitespace(String(rawFeedback || ''));
 
-  // 1. 用户决策必须绝对完整保留
   if (normAction === 'user_prompt' || normAction === 'askuserquestion') {
     return `【用户决策确认】:
 - 询问内容: ${params.question || JSON.stringify(params.questions || params)}
@@ -264,7 +262,6 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
 【调度注意】：必须严格尊重上述用户的明确选择，继续推进下一步。`;
   }
 
-  // 2. 核心任务文档与清单
   const cmdStr = String(params.command || params.cmd || '');
   const pathStr = String(params.file_path || params.path || '');
   const isTargetDocFile = CORE_DOCS_REGEX.test(pathStr) || CORE_DOCS_REGEX.test(cmdStr);
@@ -275,7 +272,6 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
     return smartTruncateLog(text, 25000, '核心任务/设计文档清单');
   }
 
-  // 3. 网络与知识检索
   if (normAction === 'net_search' || normAction === 'net_fetch' || normAction === 'websearch' || normAction === 'webfetch') {
     const pureText = text.replace(/<script[\s\S]*?<\/script>/gi, '')
                          .replace(/<style[\s\S]*?<\/style>/gi, '')
@@ -285,22 +281,18 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
     return pureText.length > budget ? smartTruncateLog(pureText, budget, '网页/检索结果') : pureText;
   }
 
-  // 4. 任务管理
   if (normAction === 'task_entry' || normAction === 'taskcreate' || normAction === 'taskupdate') {
     return `[任务管理同步] ${params.action === 'update' ? `更新任务[ID: ${params.taskId || params.task_id}]状态为: ${params.status || 'completed'}` : `创建任务: ${params.title || params.subject}`}。执行结果: ${text || '成功'}`;
   }
 
-  // 5. 工作区
   if (normAction === 'git_worktree' || normAction === 'enterworktree') {
     return `[工作区切换] 当前已进入工作区路径: ${params.path || params.name || '默认'}。反馈: ${text}`;
   }
 
-  // 6. 审查与测试
   if (normAction === 'code_audit' || normAction === 'reportfindings') {
     return text.length > 5000 ? smartTruncateLog(text, 5000, '审查报告与缺陷清单') : text;
   }
 
-  // 7. 终端命令输出
   if (normAction === 'shell_exec' || normAction === 'bash') {
     if (/successfully|done|created|installed/i.test(text) && !text.includes('error') && text.length > 2000 && !isLatestStep) {
       return `[SUCCESS] 终端命令执行完成，核心产物已就绪。\n` + text.slice(-400);
@@ -309,7 +301,6 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
     return text.length > budget ? smartTruncateLog(text, budget, '终端命令输出') : text;
   }
 
-  // 8. 文件读取
   if (normAction === 'fs_read' || normAction === 'read') {
     const budget = isLatestStep ? 12000 : (stepAge <= 2 ? 5000 : 2000);
     return text.length > budget ? smartTruncateLog(text, budget, '代码/文本读取') : text;
@@ -460,7 +451,9 @@ function parseConversation(messages = []) {
         const text = cleanNoise(msg.content);
         if (text && !text.startsWith("Today's date is") && sequentialQueue.length > 0) {
           const matchedStep = sequentialQueue.shift();
-          if (matchedStep) rawSteps.push({ ...matchedStep, feedback: text });
+          if (matchedStep) {
+            rawSteps.push({ ...matchedStep, feedback: text });
+          }
         }
       }
     }
@@ -502,7 +495,7 @@ function buildPrompt(globalTask, historyLogsText) {
 2. 拆解规范：无历史记录启动时，检查 todo.md 和 readme.md。若无，必须首步通过 fs_write 规划写入详细 todo.md。
 3. 单步原则：每个回复只能输出当前唯一步骤的配置，绝不可合并多个步骤。
 4. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
-5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n）。
+5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（换行必须使用 \\n 转义）。
 
 【强制返回格式模板示例】:
 【思考】: 说明当前步骤的意图与判断分析...
@@ -680,7 +673,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
     'Accept': 'text/event-stream, application/json'
   };
 
-  // 1. Anthropic 协议
+  // 1. Anthropic 通道尝试
   try {
     const targetUrl = `${targetBase}/v1/messages`;
     logger.info('尝试 Anthropic 通道', { URL: targetUrl });
@@ -718,10 +711,10 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
     }
 
     const errText = await res.text();
-    logger.info('Anthropic 通道未成功响应，准备降级尝试 OpenAI', { HTTP状态: res.status, 响应: errText.slice(0, 300) });
+    logger.info('Anthropic 通道未成功响应，降级尝试 OpenAI', { HTTP状态: res.status, 响应: errText.slice(0, 300) });
   } catch (e) {
     if (e.name === 'AbortError') throw e;
-    logger.error('Anthropic 通道请求异常', e.message);
+    logger.error('Anthropic 通道异常', e.message);
   }
 
   // 2. OpenAI 降级通道
@@ -768,7 +761,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
 }
 
 // ==========================================
-// 8. 统一处理器函数（彻底解决路径通配匹配失败的问题）
+// 8. Messages 处理管道 (Claude Code 原生)
 // ==========================================
 async function handleMessages(req, res) {
   const startTime = Date.now();
@@ -792,8 +785,7 @@ async function handleMessages(req, res) {
   const isCompacting = Boolean(Array.isArray(messages) && messages.length > 0 && 
     /summary of the conversation|summarize|compact/i.test(JSON.stringify(messages[messages.length - 1])));
 
-  const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
-
+  const { globalTask, historyLogsText } = parseConversation(messages || []);
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
   let heartbeatTimer = null;
   let blockIndex = 0;
@@ -897,7 +889,7 @@ async function handleMessages(req, res) {
       sendSSE('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 300 } });
       sendSSE('message_stop', { type: 'message_stop' });
       res.end();
-      logger.info('SSE 流顺利发送完毕', { 耗时: `${Date.now() - startTime}ms` });
+      logger.info('SSE 流发送完成', { 耗时: `${Date.now() - startTime}ms` });
     } else {
       const content = [];
       if (textContent) content.push({ type: 'text', text: textContent });
@@ -913,7 +905,6 @@ async function handleMessages(req, res) {
         stop_sequence: null,
         usage: { input_tokens: 150, output_tokens: 300 }
       });
-      logger.info('JSON 消息发送完毕', { 耗时: `${Date.now() - startTime}ms` });
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -925,12 +916,124 @@ async function handleMessages(req, res) {
 }
 
 // ==========================================
-// 9. 智能路由分发（修复探活与根路径）
+// 9. 【关键补齐】：Chat Completions 处理管道 (OpenAI 协议)
+// ==========================================
+async function handleChatCompletions(req, res) {
+  const startTime = Date.now();
+  const { upstreamBase } = parseTargetUrl(req);
+  const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
+  const { model, messages, stream } = req.body || {};
+
+  logger.info('命中 ChatCompletions 处理管道', {
+    '解析上游Base': upstreamBase,
+    'Model': model,
+    'Stream模式': Boolean(stream)
+  });
+
+  const abortCtrl = new AbortController();
+  req.on('close', () => {
+    logger.info('客户端提前断开连接');
+    abortCtrl.abort();
+  });
+
+  const { globalTask, historyLogsText } = parseConversation(messages || []);
+  let heartbeatTimer = null;
+
+  if (stream) {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+    heartbeatTimer = setInterval(() => {
+      if (!res.writableEnded) res.write(': keep-alive\n\n');
+    }, 5000);
+  }
+
+  try {
+    const prompt = buildPrompt(globalTask, historyLogsText);
+    const { text: assistantText, thinking } = await fetchUpstreamStream(
+      upstreamBase,
+      apiKey,
+      model,
+      prompt,
+      abortCtrl.signal
+    );
+
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+
+    const parsedAction = extractActionAndThought(assistantText);
+    const completionId = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
+    const callId = 'call_' + crypto.randomBytes(8).toString('hex');
+    let toolCalls = null;
+    let finishReason = 'stop';
+    let textContent = '';
+
+    if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
+      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
+      finishReason = 'tool_calls';
+      textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
+      toolCalls = [{
+        index: 0,
+        id: callId,
+        type: 'function',
+        function: {
+          name: mappedTool.name,
+          arguments: JSON.stringify(mappedTool.arguments)
+        }
+      }];
+    } else {
+      textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
+      finishReason = 'stop';
+    }
+
+    if (stream) {
+      res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { role: 'assistant' }, index: 0 }] })}\n\n`);
+
+      if (textContent || thinking) {
+        res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { content: textContent, reasoning_content: thinking }, index: 0 }] })}\n\n`);
+      }
+
+      if (toolCalls) {
+        res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { tool_calls: toolCalls }, index: 0 }] })}\n\n`);
+      }
+
+      res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: {}, finish_reason: finishReason, index: 0 }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      logger.info('ChatCompletions SSE 发送完毕', { 耗时: `${Date.now() - startTime}ms` });
+    } else {
+      res.json({
+        id: completionId,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: textContent,
+            reasoning_content: thinking,
+            ...(toolCalls ? { tool_calls: toolCalls } : {})
+          },
+          finish_reason: finishReason
+        }]
+      });
+    }
+  } catch (err) {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (err.name === 'AbortError') return;
+    logger.error('ChatCompletions 通道异常', err.message);
+    if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
+    else res.end();
+  }
+}
+
+// ==========================================
+// 10. 智能路由分发中心
 // ==========================================
 app.use((req, res, next) => {
   const url = req.originalUrl;
 
-  // 0. 【关键修复】：响应 Claude Code 的根路径与健康探活 (GET / 或 GET /v1)
+  // 1. 响应根路径与健康探活
   if (req.method === 'GET' && (url === '/' || url === '/v1' || url === '/v1/' || url.startsWith('/health'))) {
     logger.info('响应根路径/健康探活', { URL: url });
     return res.status(200).json({
@@ -940,7 +1043,7 @@ app.use((req, res, next) => {
     });
   }
 
-  // 1. Models 路由
+  // 2. Models 路由
   if (req.method === 'GET' && /\/v1\/models(?:\?.*)?$/i.test(url)) {
     const { upstreamBase } = parseTargetUrl(req);
     logger.info('响应 Models 请求', { upstreamBase });
@@ -963,7 +1066,7 @@ app.use((req, res, next) => {
     })();
   }
 
-  // 2. Token 计数路由
+  // 3. Token 计数路由
   if (req.method === 'POST' && /\/v1\/messages\/count_tokens(?:\?.*)?$/i.test(url)) {
     logger.info('响应 Count Tokens 请求');
     const bodyText = JSON.stringify(req.body || {});
@@ -971,17 +1074,17 @@ app.use((req, res, next) => {
     return res.json({ input_tokens: estimatedTokens });
   }
 
-  // 3. Claude Code /v1/messages 核心通道
+  // 4. Claude Code /v1/messages 核心通道
   if (req.method === 'POST' && /\/v1\/messages(?:\?.*)?$/i.test(url)) {
     return handleMessages(req, res);
   }
 
-  // 4. OpenAI 兼容 /v1/chat/completions 通道（如果有客户端调用）
+  // 5. 【核心接入】：OpenAI 兼容 /v1/chat/completions 通道
   if (req.method === 'POST' && /\/v1\/chat\/completions(?:\?.*)?$/i.test(url)) {
-    // 转发给 completions 处理逻辑
+    return handleChatCompletions(req, res);
   }
 
-  // 5. 未匹配路由
+  // 6. 未匹配路由兜底
   next();
 });
 
@@ -990,7 +1093,7 @@ app.use((req, res) => {
   logger.error('未匹配到任何内部路由！(404)', {
     Method: req.method,
     URL: req.originalUrl,
-    提示: '请检查 Claude Code 的 ANTHROPIC_BASE_URL 是否正确指向了 /v1'
+    提示: '请检查请求 URL 是否带有非标准的 /v1 路径'
   });
   res.status(404).json({
     error: {
@@ -1004,8 +1107,9 @@ process.on('unhandledRejection', (err) => logger.error('UnhandledRejection', err
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(` 🚀 CC Web 全链路可视化智能中介已启动 (端口: ${PORT})`);
-  console.log(` 默认上游: ${process.env.UPSTREAM_BASE_URL || '未配置 UPSTREAM_BASE_URL'}`);
+  console.log(` 🚀 CC Web 全链路可视化智能中介已就绪 (端口: ${PORT})`);
+  console.log(` 支持: /v1/messages (Claude) 以及 /v1/chat/completions (OpenAI)`);
+  console.log(` 支持: URL 前缀动态穿透 (/https://xxx/v1/...)`);
   console.log(`======================================================\n`);
 });
 
