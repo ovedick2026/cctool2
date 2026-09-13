@@ -925,10 +925,20 @@ async function handleMessages(req, res) {
 }
 
 // ==========================================
-// 9. 智能路由分发（完美捕获纯路径和前缀穿透路径）
+// 9. 智能路由分发（修复探活与根路径）
 // ==========================================
 app.use((req, res, next) => {
   const url = req.originalUrl;
+
+  // 0. 【关键修复】：响应 Claude Code 的根路径与健康探活 (GET / 或 GET /v1)
+  if (req.method === 'GET' && (url === '/' || url === '/v1' || url === '/v1/' || url.startsWith('/health'))) {
+    logger.info('响应根路径/健康探活', { URL: url });
+    return res.status(200).json({
+      status: 'ok',
+      message: 'Claude Code Agent Proxy is running',
+      version: '1.0.0'
+    });
+  }
 
   // 1. Models 路由
   if (req.method === 'GET' && /\/v1\/models(?:\?.*)?$/i.test(url)) {
@@ -966,7 +976,12 @@ app.use((req, res, next) => {
     return handleMessages(req, res);
   }
 
-  // 4. 未匹配路由告警
+  // 4. OpenAI 兼容 /v1/chat/completions 通道（如果有客户端调用）
+  if (req.method === 'POST' && /\/v1\/chat\/completions(?:\?.*)?$/i.test(url)) {
+    // 转发给 completions 处理逻辑
+  }
+
+  // 5. 未匹配路由
   next();
 });
 
