@@ -19,19 +19,17 @@ setGlobalDispatcher(
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '20mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 const PORT = Number(process.env.PORT || 7860);
-const IS_DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 
 function getTimestamp() {
   return new Date().toISOString().replace('T', ' ').substring(0, 19);
 }
 
 const logger = {
-  debug: (stage, details = {}) => {
-    if (!IS_DEBUG) return;
-    console.log(`\n\x1b[36m[${getTimestamp()}]\x1b[0m \x1b[32m【流程: ${stage}】\x1b[0m`);
+  info: (stage, details = {}) => {
+    console.log(`\n\x1b[36m[${getTimestamp()}]\x1b[0m \x1b[32m【${stage}】\x1b[0m`);
     for (const [k, v] of Object.entries(details)) {
       if (v !== undefined && v !== null) {
         const valStr = typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v);
@@ -45,7 +43,20 @@ const logger = {
 };
 
 // ==========================================
-// 2. 核心路由重写与安全穿透中间件 (修复 404 根源)
+// 全局流量探针（绝对不会静默）
+// ==========================================
+app.use((req, res, next) => {
+  logger.info('收到网络请求', {
+    'Method': req.method,
+    'OriginalUrl': req.originalUrl,
+    'Client-IP': req.ip,
+    'Content-Type': req.headers['content-type']
+  });
+  next();
+});
+
+// ==========================================
+// 2. 动态 URL 穿透解析 & SSRF 防御
 // ==========================================
 function isPrivateOrRestrictedHost(hostname) {
   const lower = hostname.toLowerCase();
@@ -57,9 +68,8 @@ function isPrivateOrRestrictedHost(hostname) {
   return false;
 }
 
-// 统一路径规范化：无论请求如何嵌套，一律重写为标准的 /v1/...
-app.use((req, res, next) => {
-  let raw = req.url.startsWith('/') ? req.url.slice(1) : req.url;
+function parseTargetUrl(req) {
+  let raw = req.originalUrl.startsWith('/') ? req.originalUrl.slice(1) : req.originalUrl;
   if (!/^https?:\/\//i.test(raw)) {
     try { raw = decodeURIComponent(raw); } catch {}
   }
@@ -69,26 +79,25 @@ app.use((req, res, next) => {
     try {
       const u = new URL(v1Match[1]);
       if (!isPrivateOrRestrictedHost(u.hostname)) {
-        req.upstreamBase = v1Match[1];
-        req.url = '/' + v1Match[2] + (v1Match[3] ? '?' + v1Match[3] : '');
-        return next();
+        return {
+          upstreamBase: v1Match[1],
+          endpoint: '/' + v1Match[2],
+          fullTarget: v1Match[1] + '/' + v1Match[2]
+        };
       }
     } catch {}
   }
 
-  // 兜底环境变量配置
-  req.upstreamBase = (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, '');
-  
-  // 兼容直接访问 /v1/xxx
-  const directMatch = req.url.match(/(\/v1\/(?:messages|chat\/completions|models|messages\/count_tokens)(?:\?.*)?)$/i);
-  if (directMatch) {
-    req.url = directMatch[1];
-  }
-  next();
-});
+  const envBase = (process.env.UPSTREAM_BASE_URL || '').replace(/\/$/, '');
+  return {
+    upstreamBase: envBase,
+    endpoint: req.path,
+    fullTarget: envBase + req.path
+  };
+}
 
 // ==========================================
-// 3. 工具映射器
+// 3. Action 与 CC 工具映射器
 // ==========================================
 function mapActionToClaudeCodeTool(actionName, rawParams) {
   const normAction = String(actionName || '').trim().toLowerCase();
@@ -189,13 +198,18 @@ function mapActionToClaudeCodeTool(actionName, rawParams) {
 }
 
 // ==========================================
-// 4. 智能历史处理与压缩
+// 4. 智能语义历史压缩
 // ==========================================
 const CORE_DOCS_REGEX = /(?:^|[/\s"'\`\\])(?:todo|readme)\.(?:md|markdown|txt)(?:[/\s"'\`\\]|$)/i;
 
 function sanitizeWhitespace(text) {
   if (!text || typeof text !== 'string') return '';
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function cleanNoise(text) {
@@ -242,15 +256,15 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
   const normAction = (action || '').toLowerCase();
   let text = sanitizeWhitespace(String(rawFeedback || ''));
 
-  // 1. 用户提问与选择决策（绝对完整保留）
+  // 1. 用户决策必须绝对完整保留
   if (normAction === 'user_prompt' || normAction === 'askuserquestion') {
     return `【用户决策确认】:
 - 询问内容: ${params.question || JSON.stringify(params.questions || params)}
-- 用户明确输入/所选选项: ${text || '（用户确认提交）'}
+- 用户明确输入/所选选项: ${text || '（用户未补充额外说明，已按默认提交）'}
 【调度注意】：必须严格尊重上述用户的明确选择，继续推进下一步。`;
   }
 
-  // 2. 核心任务清单
+  // 2. 核心任务文档与清单
   const cmdStr = String(params.command || params.cmd || '');
   const pathStr = String(params.file_path || params.path || '');
   const isTargetDocFile = CORE_DOCS_REGEX.test(pathStr) || CORE_DOCS_REGEX.test(cmdStr);
@@ -261,7 +275,7 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
     return smartTruncateLog(text, 25000, '核心任务/设计文档清单');
   }
 
-  // 3. 网络搜索与抓取
+  // 3. 网络与知识检索
   if (normAction === 'net_search' || normAction === 'net_fetch' || normAction === 'websearch' || normAction === 'webfetch') {
     const pureText = text.replace(/<script[\s\S]*?<\/script>/gi, '')
                          .replace(/<style[\s\S]*?<\/style>/gi, '')
@@ -281,12 +295,12 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
     return `[工作区切换] 当前已进入工作区路径: ${params.path || params.name || '默认'}。反馈: ${text}`;
   }
 
-  // 6. 代码审计
+  // 6. 审查与测试
   if (normAction === 'code_audit' || normAction === 'reportfindings') {
     return text.length > 5000 ? smartTruncateLog(text, 5000, '审查报告与缺陷清单') : text;
   }
 
-  // 7. 命令输出
+  // 7. 终端命令输出
   if (normAction === 'shell_exec' || normAction === 'bash') {
     if (/successfully|done|created|installed/i.test(text) && !text.includes('error') && text.length > 2000 && !isLatestStep) {
       return `[SUCCESS] 终端命令执行完成，核心产物已就绪。\n` + text.slice(-400);
@@ -308,7 +322,9 @@ function formatStepSmartFeedback(action, params, rawFeedback, isLatestStep, step
 function compressHistorySteps(rawSteps) {
   const validSteps = (rawSteps || []).filter(s => s.action && s.action !== 'text_response');
   const trimmed = validSteps.slice(-10);
-  if (trimmed.length === 0) return '（当前为初始化阶段，尚无历史记录）';
+  if (trimmed.length === 0) {
+    return '（当前为初始化阶段，尚无历史记录）';
+  }
 
   const lastReadMap = new Map();
   trimmed.forEach((s, idx) => {
@@ -318,6 +334,7 @@ function compressHistorySteps(rawSteps) {
   });
 
   const total = trimmed.length;
+
   return trimmed.map((step, idx) => {
     let rawFeedback = step.feedback || '[SUCCESS] 执行完成';
     let params = { ...step.params };
@@ -363,6 +380,7 @@ ${smartFeedback}`;
 function parseConversation(messages = []) {
   let globalTask = '';
   const rawSteps = [];
+
   const CC_TO_ACTION_MAP = {
     Write: 'fs_write', Read: 'fs_read', Edit: 'fs_replace', Bash: 'shell_exec',
     WebSearch: 'net_search', WebFetch: 'net_fetch', AskUserQuestion: 'user_prompt',
@@ -402,6 +420,7 @@ function parseConversation(messages = []) {
           }
         }
       }
+
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
           let params = {};
@@ -483,7 +502,7 @@ function buildPrompt(globalTask, historyLogsText) {
 2. 拆解规范：无历史记录启动时，检查 todo.md 和 readme.md。若无，必须首步通过 fs_write 规划写入详细 todo.md。
 3. 单步原则：每个回复只能输出当前唯一步骤的配置，绝不可合并多个步骤。
 4. 终止条件：当且仅当所有待办项均已完成验收时，输出 action 为 "finish" 的收尾配置。
-5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（换行必须使用 \\n 转义）。
+5. 格式严律：【思考】与【调度动作】必须严格按照模板给出，json 代码块中必须为合法 JSON（字符串内部换行必须转义为 \\n）。
 
 【强制返回格式模板示例】:
 【思考】: 说明当前步骤的意图与判断分析...
@@ -506,7 +525,7 @@ ${historyLogsText}
 }
 
 // ==========================================
-// 6. JSON 容错提取
+// 6. 安全容错 JSON 解析
 // ==========================================
 function safeParseJson(str) {
   if (!str) return null;
@@ -527,7 +546,11 @@ function safeParseJson(str) {
       }
       escaped = (c === '\\' && !escaped);
     }
-    try { return JSON.parse(res); } catch { return null; }
+    try {
+      return JSON.parse(res);
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -610,7 +633,7 @@ function extractActionAndThought(rawText) {
 }
 
 // ==========================================
-// 7. 上游通信流
+// 7. 上游通信（详细打印网络与报错细节）
 // ==========================================
 async function* readSSE(response) {
   const reader = response.body.getReader();
@@ -642,6 +665,13 @@ async function* readSSE(response) {
 }
 
 async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
+  logger.info('准备向上游发起请求', {
+    '目标Base': targetBase,
+    'Model': model,
+    'API-Key前缀': apiKey ? apiKey.slice(0, 8) + '...' : '（无）',
+    'Prompt长度': prompt.length
+  });
+
   const headers = {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${apiKey}`,
@@ -650,10 +680,11 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
     'Accept': 'text/event-stream, application/json'
   };
 
-  let primaryFailed = false;
-
+  // 1. Anthropic 协议
   try {
-    const res = await fetch(`${targetBase}/v1/messages`, {
+    const targetUrl = `${targetBase}/v1/messages`;
+    logger.info('尝试 Anthropic 通道', { URL: targetUrl });
+    const res = await fetch(targetUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -666,6 +697,7 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
     });
 
     if (res.ok) {
+      logger.info('Anthropic 通道连接成功，开始读取 SSE 流');
       let fullText = '';
       let thinkingText = '';
       for await (const chunk of readSSE(res)) {
@@ -681,25 +713,21 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
           }
         } catch {}
       }
+      logger.info('Anthropic 通道流读取完毕', { 正文长度: fullText.length, 思考长度: thinkingText.length });
       return { text: fullText, thinking: thinkingText };
     }
 
-    if (res.status === 401 || res.status === 403 || res.status === 429) {
-      const errText = await res.text();
-      throw new Error(`上游明确鉴权/限流拒绝: HTTP ${res.status} - ${errText}`);
-    }
-    await res.arrayBuffer().catch(() => {});
-    primaryFailed = true;
+    const errText = await res.text();
+    logger.info('Anthropic 通道未成功响应，准备降级尝试 OpenAI', { HTTP状态: res.status, 响应: errText.slice(0, 300) });
   } catch (e) {
     if (e.name === 'AbortError') throw e;
-    if (e.message.includes('上游明确')) throw e;
-    primaryFailed = true;
+    logger.error('Anthropic 通道请求异常', e.message);
   }
 
-  if (!primaryFailed) return { text: '', thinking: '' };
-
-  // OpenAI 降级
-  const chatRes = await fetch(`${targetBase}/v1/chat/completions`, {
+  // 2. OpenAI 降级通道
+  const chatUrl = `${targetBase}/v1/chat/completions`;
+  logger.info('尝试 OpenAI 通道', { URL: chatUrl });
+  const chatRes = await fetch(chatUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify({
@@ -712,9 +740,11 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
 
   if (!chatRes.ok) {
     const errText = await chatRes.text();
-    throw new Error(`上游调用完全失败: HTTP ${chatRes.status} - ${errText}`);
+    logger.error('OpenAI 通道亦宣告失败', { HTTP状态: chatRes.status, 响应: errText });
+    throw new Error(`上游全部失败: HTTP ${chatRes.status} - ${errText}`);
   }
 
+  logger.info('OpenAI 通道握手成功，开始读取流');
   let fullText = '';
   let thinkingText = '';
 
@@ -733,69 +763,36 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, signal) {
       }
     } catch {}
   }
+  logger.info('OpenAI 通道流读取完毕', { 正文长度: fullText.length });
   return { text: fullText, thinking: thinkingText };
 }
 
-function isCompactionRequest(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return false;
-  const lastMsg = messages[messages.length - 1];
-  const content = typeof lastMsg.content === 'string' 
-    ? lastMsg.content 
-    : (Array.isArray(lastMsg.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
-  return /summary of the conversation so far|summarize the conversation|compact|create a detailed summary/i.test(content);
-}
-
 // ==========================================
-// 8. 精准路由监听 (彻底解决匹配不上问题)
+// 8. 统一处理器函数（彻底解决路径通配匹配失败的问题）
 // ==========================================
-
-// Models
-app.get('/v1/models', async (req, res) => {
-  const upstreamBase = req.upstreamBase;
-  try {
-    const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
-    const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
-      headers: { 'Authorization': authHeader, 'x-api-key': req.headers['x-api-key'] || '' },
-      signal: AbortSignal.timeout(8000)
-    });
-    if (upstreamRes.ok) return res.json(await upstreamRes.json());
-  } catch {}
-
-  res.json({
-    object: 'list',
-    data: [
-      { id: 'claude-3-7-sonnet-20250219', object: 'model' },
-      { id: 'claude-3-5-sonnet-20241022', object: 'model' }
-    ]
-  });
-});
-
-// Count Tokens
-app.post('/v1/messages/count_tokens', (req, res) => {
-  const bodyText = JSON.stringify(req.body || {});
-  const estimatedTokens = Math.ceil(bodyText.length / 3.8);
-  res.json({ input_tokens: estimatedTokens });
-});
-
-// Messages (Claude Code 主路由)
-app.post('/v1/messages', async (req, res) => {
+async function handleMessages(req, res) {
   const startTime = Date.now();
-  const upstreamBase = req.upstreamBase;
+  const { upstreamBase } = parseTargetUrl(req);
   const apiKey = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
-  const { model, messages, stream } = req.body;
+  const { model, messages, stream } = req.body || {};
+
+  logger.info('命中 Messages 处理管道', {
+    '解析上游Base': upstreamBase,
+    'Model': model,
+    'Messages轮数': Array.isArray(messages) ? messages.length : 0,
+    'Stream模式': Boolean(stream)
+  });
 
   const abortCtrl = new AbortController();
-  req.on('close', () => abortCtrl.abort());
-
-  const isCompacting = isCompactionRequest(messages);
-  const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
-
-  logger.debug('收到 Claude Code 调度请求', {
-    目标上游: upstreamBase,
-    模型: model,
-    压缩模式: isCompacting ? '是 (Compaction)' : '否',
-    增量输入: latestTurnInput || '（初始启动）'
+  req.on('close', () => {
+    logger.info('客户端提前断开连接');
+    abortCtrl.abort();
   });
+
+  const isCompacting = Boolean(Array.isArray(messages) && messages.length > 0 && 
+    /summary of the conversation|summarize|compact/i.test(JSON.stringify(messages[messages.length - 1])));
+
+  const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
   let heartbeatTimer = null;
@@ -854,6 +851,8 @@ app.post('/v1/messages', async (req, res) => {
       stopReason = 'end_turn';
     } else {
       const parsedAction = extractActionAndThought(assistantText);
+      logger.info('模型输出提取结果', { parsedAction });
+
       if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
         const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
         stopReason = 'tool_use';
@@ -898,6 +897,7 @@ app.post('/v1/messages', async (req, res) => {
       sendSSE('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 300 } });
       sendSSE('message_stop', { type: 'message_stop' });
       res.end();
+      logger.info('SSE 流顺利发送完毕', { 耗时: `${Date.now() - startTime}ms` });
     } else {
       const content = [];
       if (textContent) content.push({ type: 'text', text: textContent });
@@ -913,6 +913,7 @@ app.post('/v1/messages', async (req, res) => {
         stop_sequence: null,
         usage: { input_tokens: 150, output_tokens: 300 }
       });
+      logger.info('JSON 消息发送完毕', { 耗时: `${Date.now() - startTime}ms` });
     }
   } catch (err) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -921,111 +922,66 @@ app.post('/v1/messages', async (req, res) => {
     if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
     else res.end();
   }
-});
+}
 
-// Chat Completions
-app.post('/v1/chat/completions', async (req, res) => {
-  const upstreamBase = req.upstreamBase;
-  const apiKey = (req.headers['authorization'] || '').replace('Bearer ', '') || req.headers['x-api-key'];
-  const { model, messages, stream } = req.body;
+// ==========================================
+// 9. 智能路由分发（完美捕获纯路径和前缀穿透路径）
+// ==========================================
+app.use((req, res, next) => {
+  const url = req.originalUrl;
 
-  const abortCtrl = new AbortController();
-  req.on('close', () => abortCtrl.abort());
-
-  const { globalTask, historyLogsText } = parseConversation(messages || []);
-  let heartbeatTimer = null;
-
-  if (stream) {
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders?.();
-    heartbeatTimer = setInterval(() => {
-      if (!res.writableEnded) res.write(': keep-alive\n\n');
-    }, 5000);
-  }
-
-  try {
-    const prompt = buildPrompt(globalTask, historyLogsText);
-    const { text: assistantText, thinking } = await fetchUpstreamStream(
-      upstreamBase,
-      apiKey,
-      model,
-      prompt,
-      abortCtrl.signal
-    );
-
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-
-    const parsedAction = extractActionAndThought(assistantText);
-    const completionId = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
-    const callId = 'call_' + crypto.randomBytes(8).toString('hex');
-    let toolCalls = null;
-    let finishReason = 'stop';
-    let textContent = '';
-
-    if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
-      const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
-      finishReason = 'tool_calls';
-      textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
-      toolCalls = [{
-        index: 0,
-        id: callId,
-        type: 'function',
-        function: {
-          name: mappedTool.name,
-          arguments: JSON.stringify(mappedTool.arguments)
-        }
-      }];
-    } else {
-      textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
-      finishReason = 'stop';
-    }
-
-    if (stream) {
-      res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { role: 'assistant' }, index: 0 }] })}\n\n`);
-
-      if (textContent || thinking) {
-        res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { content: textContent, reasoning_content: thinking }, index: 0 }] })}\n\n`);
-      }
-
-      if (toolCalls) {
-        res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: { tool_calls: toolCalls }, index: 0 }] })}\n\n`);
-      }
-
-      res.write(`data: ${JSON.stringify({ id: completionId, choices: [{ delta: {}, finish_reason: finishReason, index: 0 }] })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    } else {
+  // 1. Models 路由
+  if (req.method === 'GET' && /\/v1\/models(?:\?.*)?$/i.test(url)) {
+    const { upstreamBase } = parseTargetUrl(req);
+    logger.info('响应 Models 请求', { upstreamBase });
+    return (async () => {
+      try {
+        const authHeader = req.headers['authorization'] || `Bearer ${req.headers['x-api-key'] || ''}`;
+        const upstreamRes = await fetch(`${upstreamBase}/v1/models`, {
+          headers: { 'Authorization': authHeader, 'x-api-key': req.headers['x-api-key'] || '' },
+          signal: AbortSignal.timeout(8000)
+        });
+        if (upstreamRes.ok) return res.json(await upstreamRes.json());
+      } catch {}
       res.json({
-        id: completionId,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{
-          message: {
-            role: 'assistant',
-            content: textContent,
-            reasoning_content: thinking,
-            ...(toolCalls ? { tool_calls: toolCalls } : {})
-          },
-          finish_reason: finishReason
-        }]
+        object: 'list',
+        data: [
+          { id: 'claude-3-7-sonnet-20250219', object: 'model' },
+          { id: 'claude-3-5-sonnet-20241022', object: 'model' }
+        ]
       });
-    }
-  } catch (err) {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-    if (err.name === 'AbortError') return;
-    logger.error('ChatCompletions 通道异常', err.message);
-    if (!res.headersSent) res.status(500).json({ error: { message: err.message } });
-    else res.end();
+    })();
   }
+
+  // 2. Token 计数路由
+  if (req.method === 'POST' && /\/v1\/messages\/count_tokens(?:\?.*)?$/i.test(url)) {
+    logger.info('响应 Count Tokens 请求');
+    const bodyText = JSON.stringify(req.body || {});
+    const estimatedTokens = Math.ceil(bodyText.length / 3.8);
+    return res.json({ input_tokens: estimatedTokens });
+  }
+
+  // 3. Claude Code /v1/messages 核心通道
+  if (req.method === 'POST' && /\/v1\/messages(?:\?.*)?$/i.test(url)) {
+    return handleMessages(req, res);
+  }
+
+  // 4. 未匹配路由告警
+  next();
 });
 
-// 【关键诊断】：未匹配到的任何请求直接在终端红字打印出来，彻底告别静默失联
+// 404 兜底告警探针
 app.use((req, res) => {
-  console.warn(`\x1b[33m[404 路由未命中]\x1b[0m 收到未处理请求: ${req.method} ${req.originalUrl}`);
-  res.status(404).json({ error: { message: `Route not found: ${req.method} ${req.originalUrl}` } });
+  logger.error('未匹配到任何内部路由！(404)', {
+    Method: req.method,
+    URL: req.originalUrl,
+    提示: '请检查 Claude Code 的 ANTHROPIC_BASE_URL 是否正确指向了 /v1'
+  });
+  res.status(404).json({
+    error: {
+      message: `中介未找到对应路由: ${req.method} ${req.originalUrl}`
+    }
+  });
 });
 
 process.on('uncaughtException', (err) => logger.error('UncaughtException', err.message));
@@ -1033,8 +989,8 @@ process.on('unhandledRejection', (err) => logger.error('UnhandledRejection', err
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(` CC Web 智能中介（全局路径重写与智能压缩修复版）已就绪 (端口: ${PORT})`);
-  console.log(` 调试模式: ${IS_DEBUG ? '开启 (DEBUG=true)' : '关闭 (仅错误日志)'}`);
+  console.log(` 🚀 CC Web 全链路可视化智能中介已启动 (端口: ${PORT})`);
+  console.log(` 默认上游: ${process.env.UPSTREAM_BASE_URL || '未配置 UPSTREAM_BASE_URL'}`);
   console.log(`======================================================\n`);
 });
 
