@@ -621,7 +621,7 @@ function compressHistorySteps(rawSteps) {
     }
   });
 
-  const recentStart = Math.max(0, validSteps.length - 8);
+  const recentStart = Math.max(0, validSteps.length - 4);
   for (let i = recentStart; i < validSteps.length; i++) {
     mustKeepIndexes.add(i);
   }
@@ -647,7 +647,7 @@ function compressHistorySteps(rawSteps) {
   });
 
   const selectedIndexes = [...mustKeepIndexes].sort((a, b) => a - b);
-  const maxHistorical = 14;
+  const maxHistorical = 8;
   let indexesToRender = selectedIndexes;
 
   if (selectedIndexes.length > maxHistorical) {
@@ -711,11 +711,12 @@ ${JSON.stringify({
 ${feedback}`;
   }).join('\n\n');
 
-  if (omittedCount > 0) {
-    return `【历史压缩说明】：原始共有 ${validSteps.length} 个工具/问答步骤，已智能保留 ${indexesToRender.length} 个关键步骤，折叠 ${omittedCount} 个低价值或过旧步骤；用户问答、todo/readme、错误、测试、文件变更均优先保留。\n\n${rendered}`;
-  }
+  const finalText = omittedCount > 0
+    ? `【历史压缩说明】：原始共有 ${validSteps.length} 个工具/问答步骤，已智能保留 ${indexesToRender.length} 个关键步骤，折叠 ${omittedCount} 个低价值或过旧步骤；用户问答、todo/readme、错误、测试、文件变更均优先保留。\n\n${rendered}`
+    : rendered;
 
-  return rendered;
+  return hardLimitText(finalText, MAX_HISTORY_CHARS, '历史执行记录');
+}
 }
 
 function parseConversation(messages = []) {
@@ -908,8 +909,12 @@ function parseConversation(messages = []) {
     }
   }
 
+  globalTask = hardLimitText(globalTask, MAX_GLOBAL_TASK_CHARS, '全局目标任务');
+
   const historyLogsText = compressHistorySteps(rawSteps);
-  const latestTurnInput = rawSteps.length > 0 ? rawSteps[rawSteps.length - 1].feedback : '（初始启动任务）';
+  const latestTurnInput = rawSteps.length > 0
+    ? hardLimitText(rawSteps[rawSteps.length - 1].feedback, 8000, '最新执行反馈')
+    : '（初始启动任务）';
 
   return { globalTask, historyLogsText, latestTurnInput };
 }
@@ -1244,16 +1249,38 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 // ==========================================
 
 // ==========================================
-// Token 估算工具：不要低报/封顶，否则 Claude Code 不会提前触发 compact
+// Token 估算工具：用于提前触发 compact + 限制代理二次拼接 prompt
 // ==========================================
+const MAX_PROXY_PROMPT_CHARS = Number(process.env.MAX_PROXY_PROMPT_CHARS || 120000);
+const MAX_HISTORY_CHARS = Number(process.env.MAX_HISTORY_CHARS || 70000);
+const MAX_GLOBAL_TASK_CHARS = Number(process.env.MAX_GLOBAL_TASK_CHARS || 20000);
+
 function estimateTokensFromText(text = '') {
   const str = typeof text === 'string' ? text : JSON.stringify(text || {});
-  // 中英混合保守估算：比 /4 更接近真实，宁可略高报，方便 CC 提前 compact
+  // 保守估算，中文/代码混合宁可高估
   return Math.max(1, Math.ceil(str.length / 2.8));
 }
 
 function estimateTokensFromPayload(payload = {}) {
   return estimateTokensFromText(JSON.stringify(payload || {}));
+}
+
+function hardLimitText(text = '', maxChars = 10000, label = '内容') {
+  const str = String(text || '');
+  if (str.length <= maxChars) return str;
+
+  const head = Math.floor(maxChars * 0.45);
+  const tail = Math.floor(maxChars * 0.45);
+
+  return `${str.slice(0, head)}
+
+...[${label}过长，已强制截断 ${str.length - head - tail} 字符，避免 Prompt is too long]...
+
+${str.slice(-tail)}`;
+}
+
+function limitProxyPrompt(prompt) {
+  return hardLimitText(prompt, MAX_PROXY_PROMPT_CHARS, '代理发送给上游的Prompt');
 }
 
 app.get(/(.*)\/v1\/models$/, async (req, res) => {
@@ -1283,7 +1310,13 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
 
 // 关键修改：不要 Math.min(..., 10000)，否则 CC 以为上下文永远不大，不会自动 compact
 app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
-  const inputTokens = estimateTokensFromPayload(req.body || {});
+  const { messages } = req.body || {};
+  const { globalTask, historyLogsText } = parseConversation(messages || []);
+  const proxyPrompt = limitProxyPrompt(buildPrompt(globalTask, historyLogsText));
+
+  // 返回代理真正可能发送给上游的 prompt 估算，而不是只估原始 req.body
+  const inputTokens = estimateTokensFromText(proxyPrompt);
+
   res.json({ input_tokens: inputTokens });
 });
 
@@ -1365,6 +1398,8 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     } else {
       prompt = buildPrompt(globalTask, historyLogsText);
     }
+
+    prompt = limitProxyPrompt(prompt);
 
     // 关键：不接收/不转发 thinking chunk
     const { text: assistantText } = await fetchUpstreamStream(
@@ -1536,7 +1571,7 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   }
 
   try {
-    const prompt = buildPrompt(globalTask, historyLogsText);
+    const prompt = limitProxyPrompt(buildPrompt(globalTask, historyLogsText));
 
     // 关键：只取 text，不要使用 thinking
     const { text: assistantText } = await fetchUpstreamStream(
