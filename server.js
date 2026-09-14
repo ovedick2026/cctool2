@@ -1257,8 +1257,8 @@ const MAX_GLOBAL_TASK_CHARS = Number(process.env.MAX_GLOBAL_TASK_CHARS || 20000)
 
 function estimateTokensFromText(text = '') {
   const str = typeof text === 'string' ? text : JSON.stringify(text || {});
-  // 保守估算，中文/代码混合宁可高估
-  return Math.max(1, Math.ceil(str.length / 2.8));
+  // 温和估算
+  return Math.max(1, Math.ceil(str.length / 4));
 }
 
 function estimateTokensFromPayload(payload = {}) {
@@ -1345,13 +1345,14 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const isCompacting = isCompactionRequest(messages);
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
-  const requestInputTokens = estimateTokensFromPayload(req.body || {});
+  // 这里只作为调试观察：Claude Code 原始请求体估算
+  const rawRequestTokens = estimateTokensFromPayload(req.body || {});
 
   logger.debug('收到 Claude Code 调度请求', {
     '目标上游': upstreamBase,
     '模型': model,
     '压缩模式': isCompacting ? '是 (Compaction)' : '否',
-    '估算输入Token': requestInputTokens,
+    '原始请求估算Token': rawRequestTokens,
     '本次增量输入': latestTurnInput || '（初始启动任务）'
   });
 
@@ -1398,6 +1399,14 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     } else {
       prompt = buildPrompt(globalTask, historyLogsText);
     }
+
+    // 关键：返回给 Claude Code 的 usage 应该按中介实际发给 LLM 的 prompt 算
+    const requestInputTokens = estimateTokensFromText(prompt);
+
+    logger.debug('中介实际上游Prompt', {
+      'Prompt字符数': prompt.length,
+      '实际上游Prompt估算Token': requestInputTokens
+    });
 
     prompt = limitProxyPrompt(prompt);
 
@@ -1551,14 +1560,15 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const { model, messages, stream } = req.body;
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
-  const requestInputTokens = estimateTokensFromPayload(req.body || {});
+  // 这里只作为调试观察：Claude Code/OpenAI 客户端原始请求体估算
+  const rawRequestTokens = estimateTokensFromPayload(req.body || {});
 
   logger.debug('收到 OpenAI/ChatCompletions 调度请求', {
     目标上游: upstreamBase,
-    估算输入Token: requestInputTokens,
+    原始请求估算Token: rawRequestTokens,
     本次增量输入: latestTurnInput || '（初始启动任务）'
   });
-
+  
   let heartbeatTimer = null;
   if (stream) {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -1572,6 +1582,13 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
   try {
     const prompt = limitProxyPrompt(buildPrompt(globalTask, historyLogsText));
+
+    const requestInputTokens = estimateTokensFromText(prompt);
+
+    logger.debug('中介实际上游Prompt', {
+      Prompt字符数: prompt.length,
+      实际上游Prompt估算Token: requestInputTokens
+    });
 
     // 关键：只取 text，不要使用 thinking
     const { text: assistantText } = await fetchUpstreamStream(
