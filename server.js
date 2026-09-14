@@ -717,7 +717,6 @@ ${feedback}`;
 
   return hardLimitText(finalText, MAX_HISTORY_CHARS, '历史执行记录');
 }
-}
 
 function parseConversation(messages = []) {
   let globalTask = '';
