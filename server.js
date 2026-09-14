@@ -1241,6 +1241,20 @@ async function fetchUpstreamStream(targetBase, apiKey, model, prompt, onThinking
 // ==========================================
 // 8. 路由: /v1/models 与 /v1/messages/count_tokens
 // ==========================================
+
+// ==========================================
+// Token 估算工具：不要低报/封顶，否则 Claude Code 不会提前触发 compact
+// ==========================================
+function estimateTokensFromText(text = '') {
+  const str = typeof text === 'string' ? text : JSON.stringify(text || {});
+  // 中英混合保守估算：比 /4 更接近真实，宁可略高报，方便 CC 提前 compact
+  return Math.max(1, Math.ceil(str.length / 2.8));
+}
+
+function estimateTokensFromPayload(payload = {}) {
+  return estimateTokensFromText(JSON.stringify(payload || {}));
+}
+
 app.get(/(.*)\/v1\/models$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
   logger.debug('拉取模型列表', { 目标上游: upstreamBase });
@@ -1266,11 +1280,10 @@ app.get(/(.*)\/v1\/models$/, async (req, res) => {
   });
 });
 
+// 关键修改：不要 Math.min(..., 10000)，否则 CC 以为上下文永远不大，不会自动 compact
 app.post(/(.*)\/v1\/messages\/count_tokens$/, (req, res) => {
-  const bodyText = JSON.stringify(req.body || {});
-  const rawTokens = Math.ceil(bodyText.length / 4);
-  const safeTokens = Math.min(rawTokens, 10000);
-  res.json({ input_tokens: safeTokens });
+  const inputTokens = estimateTokensFromPayload(req.body || {});
+  res.json({ input_tokens: inputTokens });
 });
 
 function isCompactionRequest(messages) {
@@ -1284,6 +1297,10 @@ function isCompactionRequest(messages) {
 
 // ==========================================
 // 9. 核心路由: POST */v1/messages
+// 修改点：
+// 1. usage 不再固定低报
+// 2. 不向 Claude Code 回传上游 thinking
+// 3. textContent 继续保持极短
 // ==========================================
 app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const startTime = Date.now();
@@ -1294,10 +1311,13 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
   const isCompacting = isCompactionRequest(messages);
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
+  const requestInputTokens = estimateTokensFromPayload(req.body || {});
+
   logger.debug('收到 Claude Code 调度请求', {
     '目标上游': upstreamBase,
     '模型': model,
     '压缩模式': isCompacting ? '是 (Compaction)' : '否',
+    '估算输入Token': requestInputTokens,
     '本次增量输入': latestTurnInput || '（初始启动任务）'
   });
 
@@ -1314,6 +1334,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
+
     sendSSE('message_start', {
       type: 'message_start',
       message: {
@@ -1324,9 +1345,13 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 150, output_tokens: 0 }
+        usage: {
+          input_tokens: requestInputTokens,
+          output_tokens: 1
+        }
       }
     });
+
     heartbeatTimer = setInterval(() => {
       if (!res.writableEnded) res.write(': keep-alive\n\n');
     }, 5000);
@@ -1340,14 +1365,13 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
       prompt = buildPrompt(globalTask, historyLogsText);
     }
 
-    const onThinkingChunk = null;
-
+    // 关键：不接收/不转发 thinking chunk
     const { text: assistantText } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
       prompt,
-      onThinkingChunk
+      null
     );
 
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -1357,7 +1381,9 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
     let toolBlock = null;
 
     if (isCompacting) {
-      textContent = assistantText.replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '').trim() || '流水线历史状态已压缩归纳。';
+      textContent = assistantText
+        .replace(/【思考】[\s\S]*?(?=【调度动作】|$)/gi, '')
+        .trim() || '流水线历史状态已压缩归纳。';
       stopReason = 'end_turn';
     } else {
       const parsedAction = extractActionAndThought(assistantText);
@@ -1367,7 +1393,7 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         stopReason = 'tool_use';
 
         const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
-        textContent = `调度 ${mappedTool.name} ${targetDesc ? '-> ' + targetDesc : ''}`.slice(0, 80);
+        textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
 
         toolBlock = {
           type: 'tool_use',
@@ -1382,10 +1408,15 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
           '参数大小': `${JSON.stringify(mappedTool.arguments).length} 字符`
         });
       } else {
-        textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
+        textContent = parsedAction?.params?.summary || '任务已完成。';
         stopReason = 'end_turn';
       }
     }
+
+    const outputTokens =
+      estimateTokensFromText(textContent) +
+      estimateTokensFromPayload(toolBlock || {}) +
+      8;
 
     if (stream) {
       if (textContent) {
@@ -1438,7 +1469,9 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
           stop_reason: stopReason,
           stop_sequence: null
         },
-        usage: { output_tokens: 300 }
+        usage: {
+          output_tokens: outputTokens
+        }
       });
       sendSSE('message_stop', { type: 'message_stop' });
       res.end();
@@ -1455,7 +1488,10 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
         content,
         stop_reason: stopReason,
         stop_sequence: null,
-        usage: { input_tokens: 150, output_tokens: 300 }
+        usage: {
+          input_tokens: requestInputTokens,
+          output_tokens: outputTokens
+        }
       });
     }
   } catch (err) {
@@ -1468,6 +1504,10 @@ app.post(/(.*)\/v1\/messages$/, async (req, res) => {
 
 // ==========================================
 // 10. OpenWebUI / OpenAI 兼容通道
+// 修改点：
+// 1. 不再把 thinking/reasoning_content 返回给客户端
+// 2. tool_calls 场景下 textContent 不使用 parsedAction.thought
+// 3. usage 使用真实估算
 // ==========================================
 app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const { upstreamBase } = parseTargetUrl(req);
@@ -1475,8 +1515,11 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
   const { model, messages, stream } = req.body;
   const { globalTask, historyLogsText, latestTurnInput } = parseConversation(messages || []);
 
+  const requestInputTokens = estimateTokensFromPayload(req.body || {});
+
   logger.debug('收到 OpenAI/ChatCompletions 调度请求', {
     目标上游: upstreamBase,
+    估算输入Token: requestInputTokens,
     本次增量输入: latestTurnInput || '（初始启动任务）'
   });
 
@@ -1493,7 +1536,9 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
   try {
     const prompt = buildPrompt(globalTask, historyLogsText);
-    const { text: assistantText, thinking } = await fetchUpstreamStream(
+
+    // 关键：只取 text，不要使用 thinking
+    const { text: assistantText } = await fetchUpstreamStream(
       upstreamBase,
       apiKey,
       model,
@@ -1512,7 +1557,11 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
     if (parsedAction && parsedAction.action && parsedAction.action !== 'finish') {
       const mappedTool = mapActionToClaudeCodeTool(parsedAction.action, parsedAction.params);
       finishReason = 'tool_calls';
-      textContent = parsedAction.thought || `调度 ${mappedTool.name}...`;
+
+      // 关键：不要 parsedAction.thought，否则模板里的【思考】正文也会进入历史
+      const targetDesc = mappedTool.arguments?.file_path || mappedTool.arguments?.command || '';
+      textContent = `调度 ${mappedTool.name}${targetDesc ? ' -> ' + targetDesc : ''}`.slice(0, 80);
+
       toolCalls = [{
         index: 0,
         id: callId,
@@ -1523,18 +1572,25 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
         }
       }];
     } else {
-      textContent = parsedAction?.params?.summary || parsedAction?.thought || assistantText;
+      textContent = parsedAction?.params?.summary || '任务已完成。';
       finishReason = 'stop';
     }
+
+    const outputTokens =
+      estimateTokensFromText(textContent) +
+      estimateTokensFromPayload(toolCalls || {}) +
+      8;
 
     if (stream) {
       if (textContent) {
         res.write(`data: ${JSON.stringify({
           id: 'chatcmpl-1',
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
           choices: [{
             delta: {
-              content: textContent,
-              reasoning_content: thinking
+              content: textContent
             },
             index: 0
           }]
@@ -1544,6 +1600,9 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
       if (toolCalls) {
         res.write(`data: ${JSON.stringify({
           id: 'chatcmpl-1',
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
           choices: [{
             delta: {
               tool_calls: toolCalls
@@ -1555,12 +1614,21 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
 
       res.write(`data: ${JSON.stringify({
         id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model,
         choices: [{
           delta: {},
           finish_reason: finishReason,
           index: 0
-        }]
+        }],
+        usage: {
+          prompt_tokens: requestInputTokens,
+          completion_tokens: outputTokens,
+          total_tokens: requestInputTokens + outputTokens
+        }
       })}\n\n`);
+
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
@@ -1573,11 +1641,16 @@ app.post(/(.*)\/v1\/chat\/completions$/, async (req, res) => {
           message: {
             role: 'assistant',
             content: textContent,
-            reasoning_content: thinking,
             ...(toolCalls ? { tool_calls: toolCalls } : {})
           },
-          finish_reason: finishReason
-        }]
+          finish_reason: finishReason,
+          index: 0
+        }],
+        usage: {
+          prompt_tokens: requestInputTokens,
+          completion_tokens: outputTokens,
+          total_tokens: requestInputTokens + outputTokens
+        }
       });
     }
   } catch (err) {
