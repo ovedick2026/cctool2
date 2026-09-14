@@ -234,6 +234,9 @@ function sanitizeWhitespace(text) {
 
 function cleanNoise(text) {
   if (!text || typeof text !== 'string') return '';
+
+  text = cleanClaudeCodeCompactionText(text);
+  
   const cleaned = text
     .replace(/REMINDER:\s*You MUST include the sources[\s\S]*?hyperlinks\./gi, '')
     .replace(/Wasted call\s*—\s*file unchanged[\s\S]*?instead\./gi, '[SUCCESS] 文件未修改，状态已是最新。')
@@ -242,6 +245,35 @@ function cleanNoise(text) {
     .replace(/<task-notification>[\s\S]*?<\/task-notification>/gi, '')
     .replace(/<context>[\s\S]*?<\/context>/gi, '');
   return sanitizeWhitespace(cleaned);
+}
+
+function cleanClaudeCodeCompactionText(text) {
+  if (!text || typeof text !== 'string') return '';
+
+  let s = String(text);
+
+  const isCCCompaction =
+    /This session is being continued from a previous conversation/i.test(s) ||
+    /ran out of context/i.test(s) ||
+    /read the full transcript at:/i.test(s) ||
+    /\.claude\/projects\/.*\.jsonl/i.test(s);
+
+  if (!isCCCompaction) return text;
+
+  // 删除 transcript 路径和平台痕迹
+  s = s
+    .replace(/This session is being continued from a previous conversation that ran out of context\.[\s\S]*?summary below covers the earlier portion of the conversation\./gi, '')
+    .replace(/If you need specific details[\s\S]*?\.jsonl/gi, '')
+    .replace(/Continue the conversation[\s\S]*?(similar\.|break never happened\.)/gi, '')
+    .replace(/\/[^\s]*\.claude\/projects\/[^\s]+\.jsonl/gi, '')
+    .replace(/Claude Code/gi, '本地自动化工具')
+    .trim();
+
+  if (!s) {
+    return '这是一次上下文压缩后的续接任务。请根据已有任务摘要和历史执行记录继续推进，不要询问用户，不要重复初始化。';
+  }
+
+  return `这是一次上下文压缩后的续接任务。请根据以下摘要继续推进，不要询问用户，不要重复初始化。\n\n${s}`;
 }
 
 function stringifyUserContent(content) {
@@ -620,7 +652,7 @@ function compressHistorySteps(rawSteps) {
       mustKeepIndexes.add(idx);
     }
   });
-
+  //上下文轮数修改，最近4轮保留
   const recentStart = Math.max(0, validSteps.length - 4);
   for (let i = recentStart; i < validSteps.length; i++) {
     mustKeepIndexes.add(i);
@@ -647,7 +679,8 @@ function compressHistorySteps(rawSteps) {
   });
 
   const selectedIndexes = [...mustKeepIndexes].sort((a, b) => a - b);
-  const maxHistorical = 8;
+  //上下文最大保留轮数，当前为10轮
+  const maxHistorical = 10;
   let indexesToRender = selectedIndexes;
 
   if (selectedIndexes.length > maxHistorical) {
