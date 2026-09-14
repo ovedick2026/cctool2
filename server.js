@@ -652,8 +652,8 @@ function compressHistorySteps(rawSteps) {
       mustKeepIndexes.add(idx);
     }
   });
-  //上下文轮数修改，最近4轮保留
-  const recentStart = Math.max(0, validSteps.length - 4);
+  //上下文轮数修改，最近6轮保留
+  const recentStart = Math.max(0, validSteps.length - 6);
   for (let i = recentStart; i < validSteps.length; i++) {
     mustKeepIndexes.add(i);
   }
@@ -679,7 +679,7 @@ function compressHistorySteps(rawSteps) {
   });
 
   const selectedIndexes = [...mustKeepIndexes].sort((a, b) => a - b);
-  //上下文最大保留轮数，当前为10轮
+  //最大上下文保留轮数，当前为10轮
   const maxHistorical = 10;
   let indexesToRender = selectedIndexes;
 
